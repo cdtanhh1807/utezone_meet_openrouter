@@ -94,20 +94,51 @@
                                             class="fas fa-cog"></i></button>
                                 </div>
                             </div>
-                            <div class="chatroom-messages" id="chatroom-messages">
-                                <div class="chat-welcome">
-                                    <i class="fas fa-hashtag" style="font-size:40px;color:#323cae;"></i>
-                                    <h3>Chào mừng đến <span id="welcome-room-name"></span></h3>
+                            <div class="chatroom-main-split" id="chatroom-main-split">
+                                <div class="chatroom-left-pane" id="chatroom-left-pane">
+                                    <div class="chatroom-messages" id="chatroom-messages">
+                                        <div class="chat-welcome">
+                                            <i class="fas fa-hashtag" style="font-size:40px;color:#323cae;"></i>
+                                            <h3>Chào mừng đến <span id="welcome-room-name"></span></h3>
+                                        </div>
+                                    </div>
+
+                                    <div class="chatroom-input-area">
+                                        <button class="btn-attach" id="btn-attach-file" title="Đính kèm file">
+                                            <i class="fas fa-paperclip"></i>
+                                        </button>
+                                        <input type="file" id="file-input" style="display: none;" />
+                                        <input type="text" id="chat-message-input" placeholder="Nhập tin nhắn..." />
+                                        <button class="btn-send" id="btn-send-message">
+                                            <i class="fas fa-paper-plane"></i>
+                                        </button>
+                                    </div>
                                 </div>
-                            </div>
-                            <div class="chatroom-input-area">
-                                <button class="btn-attach" id="btn-attach-file" title="Đính kèm file">
-                                    <i class="fas fa-paperclip"></i>
-                                </button>
-                                <input type="file" id="file-input" style="display: none;" />
-                                <input type="text" id="chat-message-input" placeholder="Nhập tin nhắn..." />
-                                <button class="btn-send" id="btn-send-message"><i
-                                        class="fas fa-paper-plane"></i></button>
+
+                                <div class="document-ai-panel" id="document-ai-panel" style="display:none;">
+                                    <div class="document-ai-header">
+                                        <div>
+                                            <strong>UTEZoneAI</strong>
+                                            <div id="document-ai-file-name">Tài liệu</div>
+                                        </div>
+
+                                        <button class="btn-icon" id="btn-close-document-ai" title="Đóng">
+                                            <i class="fas fa-times"></i>
+                                        </button>
+                                    </div>
+
+                                    <div class="document-ai-messages" id="document-ai-messages"></div>
+                                    <div class="document-ai-disclaimer">
+                                        UTEZoneAI có thể mắc sai lầm. Hãy kiểm tra lại thông tin
+                                    </div>
+                                    <div class="document-ai-input-area">
+                                        <input type="text" id="document-ai-input"
+                                            placeholder="Hỏi về tài liệu này..." />
+                                        <button id="btn-send-document-ai">
+                                            <i class="fas fa-paper-plane"></i>
+                                        </button>
+                                    </div>
+                                </div>
                             </div>
                         </div>
                     </div>

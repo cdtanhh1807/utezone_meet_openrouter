@@ -438,6 +438,11 @@ var currentMuteState = {
     reason: null,
     muted_until: null
 };
+var currentDocumentAI = {
+    file_id: null,
+    message_id: null,
+    file_name: null
+};
 var muteUnlockTimer = null;
 var messagePollingTimer = null;
 var memberPollingTimer = null;
@@ -1393,6 +1398,276 @@ function escapeHtml(text) {
     return div.innerHTML;
 }
 
+function isDocumentFileName(fileName) {
+    return isUTEZoneAISupportedFile(fileName);
+}
+
+const UTEZONE_AI_FILE_LIMITS_MB = {
+    pdf: 12,
+    docx: 10,
+    xlsx: 5,
+    xls: 5,
+    csv: 3,
+    txt: 2,
+    md: 2,
+    js: 1,
+    jsx: 1,
+    ts: 1,
+    tsx: 1,
+    py: 1,
+    java: 1,
+    c: 1,
+    cpp: 1,
+    h: 1,
+    hpp: 1,
+    cs: 1,
+    php: 1,
+    rb: 1,
+    go: 1,
+    rs: 1,
+    html: 1,
+    css: 1,
+    json: 1,
+    xml: 1,
+    yml: 1,
+    yaml: 1,
+    sql: 1,
+    sh: 1,
+    bat: 1
+};
+
+var aiFileSizeCache = {};
+
+function getFileExtension(fileName) {
+    return (fileName || '').split('.').pop().toLowerCase();
+}
+
+function getUTEZoneAIFileSizeLimitBytes(fileName) {
+    const ext = getFileExtension(fileName);
+    const limitMb = UTEZONE_AI_FILE_LIMITS_MB[ext];
+
+    if (!limitMb) return null;
+
+    return limitMb * 1024 * 1024;
+}
+
+function formatFileSize(bytes) {
+    if (!bytes || Number.isNaN(Number(bytes))) return '';
+
+    const size = Number(bytes);
+
+    if (size < 1024) return `${size} B`;
+    if (size < 1024 * 1024) return `${(size / 1024).toFixed(1)} KB`;
+
+    return `${(size / 1024 / 1024).toFixed(1)} MB`;
+}
+
+function isUTEZoneAISupportedFile(fileName) {
+    const ext = getFileExtension(fileName);
+    return Object.prototype.hasOwnProperty.call(UTEZONE_AI_FILE_LIMITS_MB, ext);
+}
+
+async function getRemoteFileSize(fileId) {
+    if (!fileId) return null;
+
+    if (aiFileSizeCache[fileId]) {
+        return aiFileSizeCache[fileId];
+    }
+
+    try {
+        const url = fileUrlCache[fileId] || await getFileUrl(fileId);
+
+        if (!url) return null;
+
+        const response = await fetch(url, {
+            method: 'HEAD'
+        });
+
+        if (!response.ok) return null;
+
+        const contentLength = response.headers.get('content-length');
+
+        if (!contentLength) return null;
+
+        const size = Number(contentLength);
+
+        if (!size || Number.isNaN(size)) return null;
+
+        aiFileSizeCache[fileId] = size;
+
+        return size;
+
+    } catch (err) {
+        console.warn('[UTEZoneAI] Không lấy được dung lượng file:', err);
+        return null;
+    }
+}
+
+async function canAnalyzeFileWithUTEZoneAI(fileId, fileName, knownSize) {
+    if (!isUTEZoneAISupportedFile(fileName)) {
+        showToast('Định dạng file này chưa được UTEZoneAI hỗ trợ', 'warning');
+        return false;
+    }
+
+    const maxBytes = getUTEZoneAIFileSizeLimitBytes(fileName);
+
+    let fileSize = Number(knownSize || 0);
+
+    if (!fileSize && aiFileSizeCache[fileId]) {
+        fileSize = aiFileSizeCache[fileId];
+    }
+
+    if (!fileSize) {
+        fileSize = await getRemoteFileSize(fileId);
+    }
+
+    if (fileSize && maxBytes && fileSize > maxBytes) {
+        showToast('Dung lượng File quá lớn', 'error');
+        return false;
+    }
+
+    return true;
+}
+
+function renderFileMessageContent(msg, fileUrl) {
+    const fileName = msg.file_name || 'Tải file';
+    const fileId = msg.content;
+    const messageId = msg.message_id || '';
+    const fileSize = Number(msg.file_size || aiFileSizeCache[fileId] || 0);
+    const ext = getFileExtension(fileName);
+
+    let icon = '<i class="fas fa-paperclip"></i>';
+
+    if (['pdf'].includes(ext)) {
+        icon = '<i class="fas fa-file-pdf"></i>';
+    } else if (['doc', 'docx'].includes(ext)) {
+        icon = '<i class="fas fa-file-word"></i>';
+    } else if (['txt', 'md'].includes(ext)) {
+        icon = '<i class="fas fa-file-alt"></i>';
+    } else if (['xls', 'xlsx', 'csv'].includes(ext)) {
+        icon = '<i class="fas fa-file-excel"></i>';
+    } else if (['zip', 'rar', '7z'].includes(ext)) {
+        icon = '<i class="fas fa-file-archive"></i>';
+    }
+
+    const safeFileName = escapeHtml(fileName);
+
+    const askBtn = isDocumentFileName(fileName)
+        ? `
+            <button
+                type="button"
+                class="ask-document-ai-btn"
+                onclick="event.preventDefault(); event.stopPropagation(); openDocumentAI('${String(fileId).replace(/'/g, "\\'")}', '${String(messageId).replace(/'/g, "\\'")}', '${String(fileName).replace(/'/g, "\\'")}', ${fileSize || 0})">
+                <i class="fas fa-robot"></i> Hỏi UTEZoneAI
+            </button>
+        `
+        : '';
+
+    return `
+        <span class="message-file-wrapper">
+            <a href="${fileUrl}" target="_blank" style="color:#323cae; text-decoration:none;">
+                ${icon} ${safeFileName}
+            </a>
+            ${askBtn}
+        </span>
+    `;
+}
+
+function formatAIAnswer(text) {
+    if (!text) return '';
+
+    let safe = escapeHtml(text);
+
+    // Code inline: `abc`
+    safe = safe.replace(/`([^`]+)`/g, '<code>$1</code>');
+
+    // Bold: **abc**
+    safe = safe.replace(/\*\*(.*?)\*\*/g, '<strong>$1</strong>');
+
+    // Italic: *abc*
+    safe = safe.replace(/(^|[^*])\*(?!\s)([^*]+?)\*(?!\*)/g, '$1<em>$2</em>');
+
+    const lines = safe.split('\n');
+    let html = '';
+    let inList = false;
+
+    lines.forEach(line => {
+        const trimmed = line.trim();
+
+        if (!trimmed) {
+            if (inList) {
+                html += '</ul>';
+                inList = false;
+            }
+            html += '<br>';
+            return;
+        }
+
+        // Heading markdown
+        if (trimmed.startsWith('### ')) {
+            if (inList) {
+                html += '</ul>';
+                inList = false;
+            }
+            html += `<h4>${trimmed.replace(/^###\s+/, '')}</h4>`;
+            return;
+        }
+
+        if (trimmed.startsWith('## ')) {
+            if (inList) {
+                html += '</ul>';
+                inList = false;
+            }
+            html += `<h3>${trimmed.replace(/^##\s+/, '')}</h3>`;
+            return;
+        }
+
+        if (trimmed.startsWith('# ')) {
+            if (inList) {
+                html += '</ul>';
+                inList = false;
+            }
+            html += `<h3>${trimmed.replace(/^#\s+/, '')}</h3>`;
+            return;
+        }
+
+        // Bullet list: - item hoặc * item
+        if (/^[-*]\s+/.test(trimmed)) {
+            if (!inList) {
+                html += '<ul>';
+                inList = true;
+            }
+
+            html += `<li>${trimmed.replace(/^[-*]\s+/, '')}</li>`;
+            return;
+        }
+
+        // Numbered list: 1. item
+        if (/^\d+\.\s+/.test(trimmed)) {
+            if (!inList) {
+                html += '<ul>';
+                inList = true;
+            }
+
+            html += `<li>${trimmed.replace(/^\d+\.\s+/, '')}</li>`;
+            return;
+        }
+
+        if (inList) {
+            html += '</ul>';
+            inList = false;
+        }
+
+        html += `<p>${trimmed}</p>`;
+    });
+
+    if (inList) {
+        html += '</ul>';
+    }
+
+    return html;
+}
+
 async function applyMuteStatusForCurrentChannel() {
     if (!currentChannel) return;
 
@@ -1716,29 +1991,7 @@ async function appendNewMessages(newMessages) {
                 : '<span class="file-placeholder">Đang tải video...</span>';
         } else if (msgType === 'file') {
             if (fileUrl) {
-                const fileName = msg.file_name || 'Tải file';
-                const ext = (fileName.split('.').pop() || '').toLowerCase();
-
-                let icon = '<i class="fas fa-paperclip"></i>';
-                if (['jpg', 'jpeg', 'png', 'gif', 'webp'].includes(ext)) {
-                    icon = '<i class="fas fa-file-image"></i>';
-                } else if (['mp4', 'webm', 'mov'].includes(ext)) {
-                    icon = '<i class="fas fa-file-video"></i>';
-                } else if (['pdf'].includes(ext)) {
-                    icon = '<i class="fas fa-file-pdf"></i>';
-                } else if (['doc', 'docx'].includes(ext)) {
-                    icon = '<i class="fas fa-file-word"></i>';
-                } else if (['xls', 'xlsx'].includes(ext)) {
-                    icon = '<i class="fas fa-file-excel"></i>';
-                } else if (['zip', 'rar', '7z'].includes(ext)) {
-                    icon = '<i class="fas fa-file-archive"></i>';
-                }
-
-                contentHtml = `
-                    <a href="${fileUrl}" target="_blank" style="color:#323cae; text-decoration:none;">
-                        ${icon} ${escapeHtml(fileName)}
-                    </a>
-                `;
+                contentHtml = renderFileMessageContent(msg, fileUrl);
             } else {
                 contentHtml = '<span class="file-placeholder">Đang tải file...</span>';
             }
@@ -1912,29 +2165,7 @@ async function renderMessages() {
                     : '<span class="file-placeholder">Đang tải video...</span>';
             } else if (msgType === 'file') {
                 if (fileUrl) {
-                    const fileName = msg.file_name || 'Tải file';
-                    const ext = (fileName.split('.').pop() || '').toLowerCase();
-
-                    let icon = '<i class="fas fa-paperclip"></i>';
-                    if (['jpg', 'jpeg', 'png', 'gif', 'webp'].includes(ext)) {
-                        icon = '<i class="fas fa-file-image"></i>';
-                    } else if (['mp4', 'webm', 'mov'].includes(ext)) {
-                        icon = '<i class="fas fa-file-video"></i>';
-                    } else if (['pdf'].includes(ext)) {
-                        icon = '<i class="fas fa-file-pdf"></i>';
-                    } else if (['doc', 'docx'].includes(ext)) {
-                        icon = '<i class="fas fa-file-word"></i>';
-                    } else if (['xls', 'xlsx'].includes(ext)) {
-                        icon = '<i class="fas fa-file-excel"></i>';
-                    } else if (['zip', 'rar', '7z'].includes(ext)) {
-                        icon = '<i class="fas fa-file-archive"></i>';
-                    }
-
-                    contentHtml = `
-                        <a href="${fileUrl}" target="_blank" style="color:#323cae; text-decoration:none;">
-                            ${icon} ${escapeHtml(fileName)}
-                        </a>
-                    `;
+                    contentHtml = renderFileMessageContent(msg, fileUrl);
                 } else {
                     contentHtml = '<span class="file-placeholder">Đang tải file...</span>';
                 }
@@ -2070,6 +2301,125 @@ function getCurrentUserEmail() {
 function getAvatarLetter(name) { if (!name) return '?'; var parts = name.trim().split(/\s+/); if (parts.length >= 2) return (parts[0][0] + parts[parts.length - 1][0]).toUpperCase(); return name[0].toUpperCase(); }
 function formatTime(dateStr) { if (!dateStr) return ''; var d = new Date(dateStr); var hours = d.getHours().toString().padStart(2, '0'); var mins = d.getMinutes().toString().padStart(2, '0'); return hours + ':' + mins; }
 function formatDate(dateStr) { if (!dateStr) return ''; var d = new Date(dateStr); var today = new Date(); var yesterday = new Date(today); yesterday.setDate(yesterday.getDate() - 1); if (d.toDateString() === today.toDateString()) return 'Hôm nay'; if (d.toDateString() === yesterday.toDateString()) return 'Hôm qua'; var day = d.getDate().toString().padStart(2, '0'); var month = (d.getMonth() + 1).toString().padStart(2, '0'); var year = d.getFullYear(); return day + '/' + month + '/' + year; }
+function formatDateTime(dateStr) {
+    if (!dateStr) return '';
+
+    const d = new Date(dateStr);
+
+    const hours = d.getHours().toString().padStart(2, '0');
+    const mins = d.getMinutes().toString().padStart(2, '0');
+
+    const day = d.getDate().toString().padStart(2, '0');
+    const month = (d.getMonth() + 1).toString().padStart(2, '0');
+    const year = d.getFullYear();
+
+    return `${hours}:${mins} ${day}/${month}/${year}`;
+}
+
+function escapeJsString(value) {
+    return String(value || '')
+        .replace(/\\/g, '\\\\')
+        .replace(/'/g, "\\'")
+        .replace(/\n/g, '\\n')
+        .replace(/\r/g, '\\r');
+}
+
+function findMessageElementById(messageId) {
+    const items = document.querySelectorAll('.message-item[data-message-id]');
+
+    for (const item of items) {
+        if (String(item.getAttribute('data-message-id')) === String(messageId)) {
+            return item;
+        }
+    }
+
+    return null;
+}
+
+async function loadMoreMessagesForJump() {
+    if (!currentChatroom) return;
+
+    const data = await apiCall(
+        `/channels/chatrooms/${currentChatroom.room_id}/messages?limit=1000`
+    );
+
+    const messages = data.messages || [];
+
+    const fileMessages = messages.filter(m =>
+        m.msg_type !== 'text' &&
+        m.content &&
+        !fileUrlCache[m.content]
+    );
+
+    for (let msg of fileMessages) {
+        try {
+            const urlData = await apiCall(`/channels/files/${msg.content}`);
+            fileUrlCache[msg.content] = urlData.url;
+        } catch (err) {
+            console.error(`Lỗi lấy URL cho ${msg.content}:`, err);
+            fileUrlCache[msg.content] = null;
+        }
+    }
+
+    messageList = messages;
+    await renderMessages();
+
+    await new Promise(resolve => setTimeout(resolve, 80));
+}
+
+async function jumpToChatMessage(messageId) {
+    if (!messageId || !currentChatroom) {
+        showToast('Không tìm thấy tin nhắn chứa file này', 'warning');
+        return;
+    }
+
+    // Đóng modal danh sách file nếu đang mở
+    const modal = document.getElementById('modal-media-files');
+    if (modal) {
+        modal.style.display = 'none';
+    }
+
+    let msgEl = findMessageElementById(messageId);
+
+    // Nếu message chưa nằm trong DOM hiện tại thì load lại lịch sử rộng hơn
+    if (!msgEl) {
+        try {
+            await loadMoreMessagesForJump();
+            msgEl = findMessageElementById(messageId);
+        } catch (err) {
+            console.error('Jump message load error:', err);
+            showToast('Không thể tải lịch sử tin nhắn', 'error');
+            return;
+        }
+    }
+
+    if (!msgEl) {
+        showToast('Không tìm thấy tin nhắn chứa file này', 'warning');
+        return;
+    }
+
+    const container = document.getElementById('chatroom-messages');
+
+    if (container) {
+        const top = msgEl.offsetTop - container.offsetTop - 80;
+
+        container.scrollTo({
+            top: Math.max(top, 0),
+            behavior: 'smooth'
+        });
+    } else {
+        msgEl.scrollIntoView({
+            behavior: 'smooth',
+            block: 'center'
+        });
+    }
+
+    msgEl.classList.add('message-jump-highlight');
+
+    setTimeout(() => {
+        msgEl.classList.remove('message-jump-highlight');
+    }, 2500);
+}
 
 function startMessagePolling() { stopMessagePolling(); }
 function stopMessagePolling() { if (messagePollingTimer) { clearInterval(messagePollingTimer); messagePollingTimer = null; } }
@@ -2610,10 +2960,17 @@ if (attachBtn && fileInputChannel) {
                 throw error;
             }
             const data = await response.json();
+            aiFileSizeCache[data.file_id] = file.size;
             let msgType = 'file';
             if (file.type.startsWith('image/')) msgType = 'image';
             else if (file.type.startsWith('video/')) msgType = 'video';
-            await apiCall(`/channels/chatrooms/${currentChatroom.room_id}/messages`, 'POST', { content: data.file_id, msg_type: msgType, file_id: data.file_id, file_name: file.name });
+            await apiCall(`/channels/chatrooms/${currentChatroom.room_id}/messages`, 'POST', {
+                content: data.file_id,
+                msg_type: msgType,
+                file_id: data.file_id,
+                file_name: file.name,
+                file_size: file.size
+            });
             loadMessages();
             showToast('Đã gửi file', 'success');
         } catch (err) {
@@ -3092,6 +3449,162 @@ async function sendMessage() {
     }
 }
 
+async function openDocumentAI(fileId, messageId, fileName, fileSize) {
+    if (!currentChatroom) return;
+
+    const allowed = await canAnalyzeFileWithUTEZoneAI(
+        fileId,
+        fileName,
+        fileSize
+    );
+
+    if (!allowed) {
+        return;
+    }
+
+    currentDocumentAI = {
+        file_id: fileId,
+        message_id: messageId,
+        file_name: fileName
+    };
+
+    const active = document.getElementById('chatroom-active');
+    const panel = document.getElementById('document-ai-panel');
+    const fileNameEl = document.getElementById('document-ai-file-name');
+    const messagesEl = document.getElementById('document-ai-messages');
+
+    if (active) active.classList.add('document-ai-open');
+    if (panel) panel.style.display = 'flex';
+    if (fileNameEl) fileNameEl.textContent = fileName || 'Tài liệu';
+
+    if (messagesEl) {
+        messagesEl.innerHTML = `
+            <div class="document-ai-msg assistant">
+                <div class="document-ai-bubble">UTEZoneAI đang đọc và lập chỉ mục tài liệu...</div>
+            </div>
+        `;
+    }
+
+    try {
+        await apiCall(
+            `/channels/documents/${encodeURIComponent(fileId)}/prepare?message_id=${encodeURIComponent(messageId || '')}&room_id=${encodeURIComponent(currentChatroom.room_id)}`,
+            'POST'
+        );
+
+        const history = await apiCall(
+            `/channels/documents/${encodeURIComponent(fileId)}/ai-history`
+        );
+
+        renderDocumentAIHistory(history.messages || []);
+
+    } catch (err) {
+        if (messagesEl) {
+            messagesEl.innerHTML = `
+                <div class="document-ai-error">
+                    Lỗi chuẩn bị tài liệu: ${escapeHtml(err.message)}
+                </div>
+            `;
+        }
+    }
+}
+
+function closeDocumentAI() {
+    const active = document.getElementById('chatroom-active');
+    const panel = document.getElementById('document-ai-panel');
+
+    if (active) active.classList.remove('document-ai-open');
+    if (panel) panel.style.display = 'none';
+
+    currentDocumentAI = {
+        file_id: null,
+        message_id: null,
+        file_name: null
+    };
+}
+
+function renderDocumentAIHistory(messages) {
+    const messagesEl = document.getElementById('document-ai-messages');
+    if (!messagesEl) return;
+
+    if (!messages || messages.length === 0) {
+        messagesEl.innerHTML = `
+            <div class="document-ai-msg assistant">
+                <div class="document-ai-bubble">
+                    Xin chào, mình là UTEZoneAI. Bạn có thể hỏi mình về nội dung tài liệu này.
+                </div>
+            </div>
+        `;
+        return;
+    }
+
+    messagesEl.innerHTML = messages.map(m => `
+        <div class="document-ai-msg ${m.role === 'user' ? 'user' : 'assistant'}">
+            <div class="document-ai-bubble">
+                ${m.role === 'assistant' ? formatAIAnswer(m.content || '') : escapeHtml(m.content || '')}
+            </div>
+        </div>
+    `).join('');
+
+    messagesEl.scrollTop = messagesEl.scrollHeight;
+}
+
+function appendDocumentAIMessage(role, content) {
+    const messagesEl = document.getElementById('document-ai-messages');
+    if (!messagesEl) return;
+
+    messagesEl.insertAdjacentHTML('beforeend', `
+        <div class="document-ai-msg ${role === 'user' ? 'user' : 'assistant'}">
+            <div class="document-ai-bubble">
+                ${role === 'assistant' ? formatAIAnswer(content || '') : escapeHtml(content || '')}
+            </div>
+        </div>
+    `);
+
+    messagesEl.scrollTop = messagesEl.scrollHeight;
+}
+
+async function sendDocumentAIQuestion() {
+    const input = document.getElementById('document-ai-input');
+
+    if (!input || !currentDocumentAI.file_id) return;
+
+    const question = input.value.trim();
+
+    if (!question) return;
+
+    input.value = '';
+
+    appendDocumentAIMessage('user', question);
+    appendDocumentAIMessage('assistant', 'UTEZoneAI đang suy nghĩ...');
+
+    try {
+        const result = await apiCall(
+            `/channels/documents/${encodeURIComponent(currentDocumentAI.file_id)}/ask`,
+            'POST',
+            { question }
+        );
+
+        const messagesEl = document.getElementById('document-ai-messages');
+        const assistantBubbles = messagesEl?.querySelectorAll('.document-ai-msg.assistant .document-ai-bubble');
+        const lastAssistant = assistantBubbles?.[assistantBubbles.length - 1];
+
+        if (lastAssistant) {
+            lastAssistant.innerHTML = formatAIAnswer(result.answer || 'Không có câu trả lời');
+        } else {
+            appendDocumentAIMessage('assistant', result.answer || 'Không có câu trả lời');
+        }
+
+    } catch (err) {
+        const messagesEl = document.getElementById('document-ai-messages');
+        const assistantBubbles = messagesEl?.querySelectorAll('.document-ai-msg.assistant .document-ai-bubble');
+        const lastAssistant = assistantBubbles?.[assistantBubbles.length - 1];
+
+        if (lastAssistant) {
+            lastAssistant.textContent = 'Lỗi: ' + err.message;
+        }
+    }
+}
+
 function updateMediaButtonsVisibility() {
     const isVoice = currentChatroom && currentChatroom.room_type === 'voice';
     const mediaGalleryBtn = document.getElementById('btn-media-gallery');
@@ -3140,7 +3653,32 @@ document.getElementById('btn-files-list')?.addEventListener('click', async () =>
         let html = '<ul class="file-list">';
         for (let item of files) {
             const fileUrl = await getFileUrl(item.file_id);
-            html += `<li><i class="fas fa-file"></i> <a href="${fileUrl}" target="_blank">${escapeHtml(item.file_name)}</a> - ${escapeHtml(item.sender_name)} (${formatDate(item.created_at)})</li>`;
+            html += `
+                <li class="file-list-item">
+                    <i class="fas fa-file"></i>
+
+                    <button
+                        type="button"
+                        class="file-jump-link"
+                        title="Đi tới tin nhắn chứa file này"
+                        onclick="jumpToChatMessage('${escapeJsString(item.message_id)}')">
+                        ${escapeHtml(item.file_name)}
+                    </button>
+
+                    <a
+                        class="file-download-link"
+                        href="${fileUrl}"
+                        target="_blank"
+                        title="Mở hoặc tải file">
+                        <i class="fas fa-download"></i>
+                    </a>
+
+                    <span class="file-list-meta">
+                        - ${escapeHtml(item.sender_name)}
+                        (${formatDateTime(item.created_at)})
+                    </span>
+                </li>
+            `;
         }
         html += '</ul>';
         contentDiv.innerHTML = html;
@@ -3184,6 +3722,16 @@ document.getElementById('btn-start-meeting').addEventListener('click', function 
 document.getElementById('search-channel').addEventListener('input', renderChannelList);
 document.querySelectorAll('.modal-close').forEach(btn => { btn.addEventListener('click', function () { var modalId = btn.getAttribute('data-modal'); document.getElementById(modalId).style.display = 'none'; }); });
 document.querySelectorAll('.modal-overlay').forEach(overlay => { overlay.addEventListener('click', function (e) { if (e.target === overlay) overlay.style.display = 'none'; }); });
+
+document.getElementById('btn-close-document-ai')?.addEventListener('click', closeDocumentAI);
+
+document.getElementById('btn-send-document-ai')?.addEventListener('click', sendDocumentAIQuestion);
+
+document.getElementById('document-ai-input')?.addEventListener('keyup', function (event) {
+    if (event.key === 'Enter') {
+        sendDocumentAIQuestion();
+    }
+});
 
 function goBack() { window.history.back(); }
 
