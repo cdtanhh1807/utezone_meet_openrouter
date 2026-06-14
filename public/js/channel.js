@@ -73,6 +73,23 @@ function normalizeEmail(email) {
     return (email || '').toString().trim().toLowerCase();
 }
 
+function closeDocumentAIPanelOnly() {
+    const panel = document.getElementById('document-ai-panel');
+    const split = document.getElementById('chatroom-main-split');
+
+    if (panel) panel.style.display = 'none';
+    if (split) split.classList.remove('document-ai-open');
+
+    currentAIConversation = null;
+    currentDocumentAI = {
+        file_id: null,
+        message_id: null,
+        file_name: null
+    };
+
+    documentAIMode = 'closed';
+}
+
 function disableChatInputForMute(reason, mutedUntil) {
     currentMuteState = {
         muted: true,
@@ -448,6 +465,10 @@ var messagePollingTimer = null;
 var memberPollingTimer = null;
 let channelPollingTimer = null;
 let chatroomPollingTimer = null;
+
+var currentAIConversation = null;
+var aiConversationList = [];
+var documentAIMode = 'closed'; 
 
 var avatarCache = {};
 async function getUserAvatar(email) {
@@ -1668,6 +1689,460 @@ function formatAIAnswer(text) {
     return html;
 }
 
+function showDocumentAIPanel() {
+    const panel = document.getElementById('document-ai-panel');
+    const split = document.getElementById('chatroom-main-split');
+
+    if (panel) panel.style.display = 'flex';
+    if (split) split.classList.add('document-ai-open');
+}
+
+function setDocumentAIView(view) {
+    documentAIMode = view;
+
+    const listView = document.getElementById('document-ai-list-view');
+    const createView = document.getElementById('document-ai-create-view');
+    const chatView = document.getElementById('document-ai-chat-view');
+    const backBtn = document.getElementById('btn-document-ai-back');
+
+    if (listView) listView.style.display = view === 'list' ? 'flex' : 'none';
+    if (createView) createView.style.display = view === 'create' ? 'flex' : 'none';
+    if (chatView) chatView.style.display = view === 'chat' ? 'flex' : 'none';
+
+    if (backBtn) {
+        backBtn.style.display = view === 'chat' || view === 'create' ? 'inline-flex' : 'none';
+    }
+}
+
+async function openRoomDocumentAIList() {
+    if (!currentChatroom) return;
+
+    if (currentChatroom.room_type === 'voice') {
+        closeDocumentAIPanelOnly();
+        return;
+    }
+
+    showDocumentAIPanel();
+    setDocumentAIView('list');
+
+    const titleEl = document.getElementById('document-ai-file-name');
+    if (titleEl) {
+        titleEl.textContent = 'Danh sách cuộc trò chuyện';
+    }
+
+    await loadAIConversationList();
+}
+
+async function loadAIConversationList() {
+    if (!currentChatroom) return;
+
+    const listEl = document.getElementById('document-ai-conversation-list');
+
+    if (listEl) {
+        listEl.innerHTML = `
+            <div class="document-ai-loading">
+                <i class="fas fa-spinner fa-spin"></i> Đang tải...
+            </div>
+        `;
+    }
+
+    try {
+        const data = await apiCall(
+            `/channels/chatrooms/${currentChatroom.room_id}/ai-conversations`
+        );
+
+        aiConversationList = data.conversations || [];
+
+        renderAIConversationList();
+
+    } catch (err) {
+        if (listEl) {
+            listEl.innerHTML = `
+                <div class="document-ai-empty">
+                    Lỗi tải danh sách: ${escapeHtml(err.message)}
+                </div>
+            `;
+        }
+    }
+}
+
+function renderAIConversationList() {
+    const listEl = document.getElementById('document-ai-conversation-list');
+    if (!listEl) return;
+
+    if (!aiConversationList.length) {
+        listEl.innerHTML = `
+            <div class="document-ai-empty">
+                Chưa có cuộc trò chuyện nào với UTEZoneAI trong room này.
+            </div>
+        `;
+        return;
+    }
+
+    listEl.innerHTML = aiConversationList.map(conv => {
+        const docs = conv.documents || [];
+        const docCount = docs.length;
+        const updatedAt = conv.updated_at || conv.created_at;
+
+        return `
+            <div class="document-ai-conversation-row">
+                <button
+                    type="button"
+                    class="document-ai-conversation-item"
+                    onclick="openAIConversation('${escapeJsString(conv.conversation_id)}')">
+                    <div class="ai-conv-icon">
+                        <i class="fas fa-comments"></i>
+                    </div>
+
+                    <div class="ai-conv-main">
+                        <div class="ai-conv-title">${escapeHtml(conv.title || 'Cuộc trò chuyện')}</div>
+                        <div class="ai-conv-meta">
+                            ${docCount} tài liệu · ${formatDateTime(updatedAt)}
+                        </div>
+                        <div class="ai-conv-docs">
+                            ${escapeHtml(docs.slice(0, 3).map(d => d.file_name).join(', '))}
+                        </div>
+                    </div>
+                </button>
+
+                <button
+                    type="button"
+                    class="btn-rename-ai-conversation"
+                    title="Đổi tên cuộc trò chuyện"
+                    onclick="renameAIConversation(event, '${escapeJsString(conv.conversation_id)}', '${escapeJsString(conv.title || 'Cuộc trò chuyện')}')">
+                    <i class="fas fa-pen"></i>
+                </button>
+
+                <button
+                    type="button"
+                    class="btn-delete-ai-conversation"
+                    title="Xóa cuộc trò chuyện"
+                    onclick="deleteAIConversation(event, '${escapeJsString(conv.conversation_id)}')">
+                    <i class="fas fa-trash"></i>
+                </button>
+            </div>
+        `;
+    }).join('');
+}
+
+document.getElementById('btn-room-document-ai')?.addEventListener('click', openRoomDocumentAIList);
+
+async function renameAIConversation(event, conversationId, currentTitle) {
+    if (event) {
+        event.preventDefault();
+        event.stopPropagation();
+    }
+
+    if (!conversationId) return;
+
+    const newTitle = prompt(
+        'Nhập tên mới cho cuộc trò chuyện:',
+        currentTitle || ''
+    );
+
+    if (newTitle === null) return;
+
+    const title = newTitle.trim();
+
+    if (!title) {
+        showToast('Tên cuộc trò chuyện không được để trống', 'warning');
+        return;
+    }
+
+    try {
+        const result = await apiCall(
+            `/channels/ai-conversations/${conversationId}/rename`,
+            'PATCH',
+            {
+                title
+            }
+        );
+
+        showToast('Đã đổi tên cuộc trò chuyện', 'success');
+
+        if (
+            currentAIConversation &&
+            currentAIConversation.conversation_id === conversationId
+        ) {
+            currentAIConversation.title = result.title || title;
+
+            const titleEl = document.getElementById('document-ai-file-name');
+            if (titleEl) {
+                const docs = currentAIConversation.documents || [];
+                titleEl.textContent = `${currentAIConversation.title} · ${docs.length} tài liệu`;
+            }
+        }
+
+        await loadAIConversationList();
+
+    } catch (err) {
+        showToast('Lỗi đổi tên cuộc trò chuyện: ' + err.message, 'error');
+    }
+}
+
+async function handleDocumentAIWhenChatroomChanged() {
+    if (!currentChatroom) return;
+
+    const isVoiceRoom = currentChatroom.room_type === 'voice';
+
+    // Nếu chuyển sang voice room thì tự đóng AI panel
+    if (isVoiceRoom) {
+        closeDocumentAIPanelOnly();
+        return;
+    }
+
+    const panel = document.getElementById('document-ai-panel');
+    const isPanelOpen = panel && panel.style.display !== 'none';
+
+    if (!isPanelOpen) return;
+
+    // Nếu panel đang mở, chuyển về danh sách cuộc trò chuyện của room mới
+    currentAIConversation = null;
+
+    setDocumentAIView('list');
+
+    const titleEl = document.getElementById('document-ai-file-name');
+    if (titleEl) {
+        titleEl.textContent = 'Danh sách cuộc trò chuyện';
+    }
+
+    await loadAIConversationList();
+}
+
+async function deleteAIConversation(event, conversationId) {
+    if (event) {
+        event.preventDefault();
+        event.stopPropagation();
+    }
+
+    if (!conversationId) return;
+
+    const ok = confirm('Bạn có chắc muốn xóa cuộc trò chuyện này không?');
+
+    if (!ok) return;
+
+    try {
+        await apiCall(
+            `/channels/ai-conversations/${conversationId}`,
+            'DELETE'
+        );
+
+        showToast('Đã xóa cuộc trò chuyện', 'success');
+
+        if (
+            currentAIConversation &&
+            currentAIConversation.conversation_id === conversationId
+        ) {
+            currentAIConversation = null;
+            setDocumentAIView('list');
+        }
+
+        await loadAIConversationList();
+
+    } catch (err) {
+        showToast('Lỗi xóa cuộc trò chuyện: ' + err.message, 'error');
+    }
+}
+
+async function openAIConversation(conversationId) {
+    if (!conversationId) return;
+
+    showDocumentAIPanel();
+    setDocumentAIView('chat');
+
+    const messagesEl = document.getElementById('document-ai-messages');
+
+    if (messagesEl) {
+        messagesEl.innerHTML = `
+            <div class="document-ai-msg assistant">
+                <div class="document-ai-bubble">Đang tải cuộc trò chuyện...</div>
+            </div>
+        `;
+    }
+
+    try {
+        const data = await apiCall(
+            `/channels/ai-conversations/${conversationId}`
+        );
+
+        currentAIConversation = data.conversation;
+
+        const titleEl = document.getElementById('document-ai-file-name');
+        if (titleEl) {
+            const docs = currentAIConversation.documents || [];
+            titleEl.textContent = `${currentAIConversation.title || 'Cuộc trò chuyện'} · ${docs.length} tài liệu`;
+        }
+
+        renderDocumentAIHistory(data.messages || []);
+
+    } catch (err) {
+        showToast('Lỗi mở cuộc trò chuyện: ' + err.message, 'error');
+        setDocumentAIView('list');
+    }
+}
+
+function backToAIConversationList() {
+    currentAIConversation = null;
+    setDocumentAIView('list');
+
+    const titleEl = document.getElementById('document-ai-file-name');
+    if (titleEl) titleEl.textContent = 'Danh sách cuộc trò chuyện';
+
+    loadAIConversationList();
+}
+
+document.getElementById('btn-document-ai-back')?.addEventListener('click', () => {
+    if (documentAIMode === 'chat' || documentAIMode === 'create') {
+        backToAIConversationList();
+    }
+});
+
+function openCreateAIConversationView() {
+    setDocumentAIView('create');
+
+    const titleEl = document.getElementById('document-ai-file-name');
+    if (titleEl) titleEl.textContent = 'Nhập tài liệu';
+
+    const titleInput = document.getElementById('ai-conversation-title');
+    const fileInput = document.getElementById('ai-conversation-files');
+    const selectedEl = document.getElementById('ai-conversation-selected-files');
+
+    if (titleInput) titleInput.value = '';
+    if (fileInput) fileInput.value = '';
+    if (selectedEl) selectedEl.innerHTML = '';
+}
+
+document.getElementById('btn-create-ai-conversation')?.addEventListener('click', openCreateAIConversationView);
+document.getElementById('btn-cancel-create-ai-conversation')?.addEventListener('click', backToAIConversationList);
+
+document.getElementById('ai-conversation-files')?.addEventListener('change', function () {
+    const selectedEl = document.getElementById('ai-conversation-selected-files');
+    if (!selectedEl) return;
+
+    const files = Array.from(this.files || []);
+
+    if (!files.length) {
+        selectedEl.innerHTML = '';
+        return;
+    }
+
+    selectedEl.innerHTML = files.map(file => `
+        <div class="ai-selected-file-item">
+            <i class="fas fa-file"></i>
+            <span>${escapeHtml(file.name)}</span>
+            <small>${formatFileSize(file.size)}</small>
+        </div>
+    `).join('');
+});
+
+async function uploadAIConversationFile(file) {
+    const token = getToken();
+    const formData = new FormData();
+    formData.append('file', file);
+
+    const response = await fetch(
+        `${API_URL}/channels/chatrooms/${currentChatroom.room_id}/upload`,
+        {
+            method: 'POST',
+            headers: {
+                Authorization: `Bearer ${token}`
+            },
+            body: formData
+        }
+    );
+
+    if (!response.ok) {
+        const errData = await response.json().catch(() => ({}));
+        throw new Error(extractErrorMessage(errData, 'Upload failed'));
+    }
+
+    const data = await response.json();
+
+    if (data.file_id) {
+        aiFileSizeCache[data.file_id] = file.size;
+    }
+
+    return {
+        file_id: data.file_id,
+        file_name: file.name,
+        message_id: null,
+        source: 'upload',
+        file_size: file.size
+    };
+}
+
+async function submitCreateAIConversation() {
+    if (!currentChatroom) return;
+
+    const titleInput = document.getElementById('ai-conversation-title');
+    const fileInput = document.getElementById('ai-conversation-files');
+    const submitBtn = document.getElementById('btn-submit-create-ai-conversation');
+
+    const title = (titleInput?.value || '').trim();
+    const files = Array.from(fileInput?.files || []);
+
+    if (!title) {
+        showToast('Vui lòng nhập tên cuộc trò chuyện', 'warning');
+        return;
+    }
+
+    if (!files.length) {
+        showToast('Vui lòng chọn ít nhất một tài liệu', 'warning');
+        return;
+    }
+
+    for (const file of files) {
+        const allowed = await canAnalyzeFileWithUTEZoneAI(
+            null,
+            file.name,
+            file.size
+        );
+
+        if (!allowed) {
+            return;
+        }
+    }
+
+    const oldHtml = submitBtn ? submitBtn.innerHTML : '';
+
+    try {
+        if (submitBtn) {
+            submitBtn.disabled = true;
+            submitBtn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Đang xử lý...';
+        }
+
+        const uploadedDocs = [];
+
+        for (const file of files) {
+            const uploaded = await uploadAIConversationFile(file);
+            uploadedDocs.push(uploaded);
+        }
+
+        const conversation = await apiCall(
+            `/channels/chatrooms/${currentChatroom.room_id}/ai-conversations`,
+            'POST',
+            {
+                title,
+                documents: uploadedDocs
+            }
+        );
+
+        showToast('Đã tạo cuộc trò chuyện với UTEZoneAI', 'success');
+
+        await openAIConversation(conversation.conversation_id);
+
+    } catch (err) {
+        showToast('Lỗi tạo cuộc trò chuyện: ' + err.message, 'error');
+    } finally {
+        if (submitBtn) {
+            submitBtn.disabled = false;
+            submitBtn.innerHTML = oldHtml || 'Xong';
+        }
+    }
+}
+
+document.getElementById('btn-submit-create-ai-conversation')?.addEventListener('click', submitCreateAIConversation);
+
 async function applyMuteStatusForCurrentChannel() {
     if (!currentChannel) return;
 
@@ -1860,6 +2335,8 @@ function selectChatroom(roomId) {
         } else {
             refreshMessages();
         }
+
+        handleDocumentAIWhenChatroomChanged();
     }
     apiCall(`/channels/chatrooms/${roomId}/mark-read`, 'POST').catch(console.error);
     if (unreadCounts[roomId]) {
@@ -3458,53 +3935,40 @@ async function openDocumentAI(fileId, messageId, fileName, fileSize) {
         fileSize
     );
 
-    if (!allowed) {
-        return;
-    }
+    if (!allowed) return;
 
-    currentDocumentAI = {
-        file_id: fileId,
-        message_id: messageId,
-        file_name: fileName
-    };
+    showDocumentAIPanel();
+    setDocumentAIView('chat');
 
-    const active = document.getElementById('chatroom-active');
-    const panel = document.getElementById('document-ai-panel');
-    const fileNameEl = document.getElementById('document-ai-file-name');
+    const titleEl = document.getElementById('document-ai-file-name');
+    if (titleEl) titleEl.textContent = fileName || 'Tài liệu';
+
     const messagesEl = document.getElementById('document-ai-messages');
-
-    if (active) active.classList.add('document-ai-open');
-    if (panel) panel.style.display = 'flex';
-    if (fileNameEl) fileNameEl.textContent = fileName || 'Tài liệu';
-
     if (messagesEl) {
         messagesEl.innerHTML = `
             <div class="document-ai-msg assistant">
-                <div class="document-ai-bubble">UTEZoneAI đang đọc và lập chỉ mục tài liệu...</div>
+                <div class="document-ai-bubble">
+                    Đang chuẩn bị tài liệu...
+                </div>
             </div>
         `;
     }
 
     try {
-        await apiCall(
-            `/channels/documents/${encodeURIComponent(fileId)}/prepare?message_id=${encodeURIComponent(messageId || '')}&room_id=${encodeURIComponent(currentChatroom.room_id)}`,
-            'POST'
+        const conversation = await apiCall(
+            `/channels/chatrooms/${currentChatroom.room_id}/ai-conversations/from-file`,
+            'POST',
+            {
+                file_id: fileId,
+                file_name: fileName,
+                message_id: messageId
+            }
         );
 
-        const history = await apiCall(
-            `/channels/documents/${encodeURIComponent(fileId)}/ai-history`
-        );
-
-        renderDocumentAIHistory(history.messages || []);
+        await openAIConversation(conversation.conversation_id);
 
     } catch (err) {
-        if (messagesEl) {
-            messagesEl.innerHTML = `
-                <div class="document-ai-error">
-                    Lỗi chuẩn bị tài liệu: ${escapeHtml(err.message)}
-                </div>
-            `;
-        }
+        showToast('Lỗi mở UTEZoneAI: ' + err.message, 'error');
     }
 }
 
@@ -3565,40 +4029,32 @@ function appendDocumentAIMessage(role, content) {
 
 async function sendDocumentAIQuestion() {
     const input = document.getElementById('document-ai-input');
+    const question = input?.value.trim();
 
-    if (!input || !currentDocumentAI.file_id) return;
-
-    const question = input.value.trim();
-
-    if (!question) return;
+    if (!question || !currentAIConversation) return;
 
     input.value = '';
 
     appendDocumentAIMessage('user', question);
-    appendDocumentAIMessage('assistant', 'UTEZoneAI đang suy nghĩ...');
+    appendDocumentAIMessage('assistant', 'Đang suy nghĩ...');
+
+    const messagesEl = document.getElementById('document-ai-messages');
+    const lastAssistant = messagesEl?.querySelector('.document-ai-msg.assistant:last-child .document-ai-bubble');
 
     try {
         const result = await apiCall(
-            `/channels/documents/${encodeURIComponent(currentDocumentAI.file_id)}/ask`,
+            `/channels/ai-conversations/${currentAIConversation.conversation_id}/ask`,
             'POST',
-            { question }
+            {
+                question
+            }
         );
-
-        const messagesEl = document.getElementById('document-ai-messages');
-        const assistantBubbles = messagesEl?.querySelectorAll('.document-ai-msg.assistant .document-ai-bubble');
-        const lastAssistant = assistantBubbles?.[assistantBubbles.length - 1];
 
         if (lastAssistant) {
             lastAssistant.innerHTML = formatAIAnswer(result.answer || 'Không có câu trả lời');
-        } else {
-            appendDocumentAIMessage('assistant', result.answer || 'Không có câu trả lời');
         }
 
     } catch (err) {
-        const messagesEl = document.getElementById('document-ai-messages');
-        const assistantBubbles = messagesEl?.querySelectorAll('.document-ai-msg.assistant .document-ai-bubble');
-        const lastAssistant = assistantBubbles?.[assistantBubbles.length - 1];
-
         if (lastAssistant) {
             lastAssistant.textContent = 'Lỗi: ' + err.message;
         }
@@ -3607,12 +4063,16 @@ async function sendDocumentAIQuestion() {
 
 function updateMediaButtonsVisibility() {
     const isVoice = currentChatroom && currentChatroom.room_type === 'voice';
+
     const mediaGalleryBtn = document.getElementById('btn-media-gallery');
     const filesListBtn = document.getElementById('btn-files-list');
     const searchBtn = document.getElementById('btn-search-messages');
+    const roomDocumentAIBtn = document.getElementById('btn-room-document-ai');
+
     if (mediaGalleryBtn) mediaGalleryBtn.style.display = isVoice ? 'none' : 'inline-flex';
     if (filesListBtn) filesListBtn.style.display = isVoice ? 'none' : 'inline-flex';
     if (searchBtn) searchBtn.style.display = isVoice ? 'none' : 'inline-flex';
+    if (roomDocumentAIBtn) roomDocumentAIBtn.style.display = isVoice ? 'none' : 'inline-flex';
 }
 
 // Media gallery, files, search listeners

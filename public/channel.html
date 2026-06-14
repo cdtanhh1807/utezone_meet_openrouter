@@ -92,6 +92,8 @@
                                             class="fas fa-video"></i> Bắt đầu họp</button>
                                     <button class="btn-icon" id="btn-chatroom-settings" title="Cài đặt phòng"><i
                                             class="fas fa-cog"></i></button>
+                                    <button id="btn-room-document-ai" class="btn-icon" title="Chat với UTEZoneAI">
+                                        <i class="fas fa-robot"></i></button>
                                 </div>
                             </div>
                             <div class="chatroom-main-split" id="chatroom-main-split">
@@ -117,7 +119,12 @@
 
                                 <div class="document-ai-panel" id="document-ai-panel" style="display:none;">
                                     <div class="document-ai-header">
-                                        <div>
+                                        <button type="button" class="document-ai-back-btn" id="btn-document-ai-back"
+                                            style="display:none;" title="Quay lại danh sách">
+                                            <i class="fas fa-arrow-left"></i>
+                                        </button>
+
+                                        <div class="document-ai-title-wrap">
                                             <strong>UTEZoneAI</strong>
                                             <div id="document-ai-file-name">Tài liệu</div>
                                         </div>
@@ -127,16 +134,59 @@
                                         </button>
                                     </div>
 
-                                    <div class="document-ai-messages" id="document-ai-messages"></div>
-                                    <div class="document-ai-disclaimer">
-                                        UTEZoneAI có thể mắc sai lầm. Hãy kiểm tra lại thông tin
+                                    <div class="document-ai-list-view" id="document-ai-list-view" style="display:none;">
+                                        <div class="document-ai-list-top">
+                                            <button id="btn-create-ai-conversation" class="btn-primary-small">
+                                                <i class="fas fa-plus"></i> Nhập tài liệu
+                                            </button>
+                                        </div>
+
+                                        <div id="document-ai-conversation-list" class="document-ai-conversation-list">
+                                        </div>
                                     </div>
-                                    <div class="document-ai-input-area">
-                                        <input type="text" id="document-ai-input"
-                                            placeholder="Hỏi về tài liệu này..." />
-                                        <button id="btn-send-document-ai">
-                                            <i class="fas fa-paper-plane"></i>
-                                        </button>
+
+                                    <div class="document-ai-create-view" id="document-ai-create-view"
+                                        style="display:none;">
+                                        <div class="document-ai-form-group">
+                                            <label>Tên cuộc trò chuyện</label>
+                                            <input type="text" id="ai-conversation-title"
+                                                placeholder="Ví dụ: Phân tích báo cáo tuần">
+                                        </div>
+
+                                        <div class="document-ai-form-group">
+                                            <label>Chọn tài liệu</label>
+                                            <input type="file" id="ai-conversation-files" multiple>
+                                            <div class="document-ai-form-hint">
+                                                Hỗ trợ PDF, DOCX, Excel, CSV, TXT, MD và file code.
+                                            </div>
+                                        </div>
+
+                                        <div id="ai-conversation-selected-files" class="ai-selected-files"></div>
+
+                                        <div class="document-ai-create-actions">
+                                            <button id="btn-cancel-create-ai-conversation" class="btn-secondary-small">
+                                                Hủy
+                                            </button>
+                                            <button id="btn-submit-create-ai-conversation" class="btn-primary-small">
+                                                Xong
+                                            </button>
+                                        </div>
+                                    </div>
+
+                                    <div class="document-ai-chat-view" id="document-ai-chat-view" style="display:none;">
+                                        <div class="document-ai-messages" id="document-ai-messages"></div>
+
+                                        <div class="document-ai-disclaimer">
+                                            UTEZoneAI có thể mắc sai lầm. Hãy kiểm tra lại thông tin
+                                        </div>
+
+                                        <div class="document-ai-input-area">
+                                            <input type="text" id="document-ai-input"
+                                                placeholder="Hỏi về tài liệu này...">
+                                            <button id="btn-send-document-ai">
+                                                <i class="fas fa-paper-plane"></i>
+                                            </button>
+                                        </div>
                                     </div>
                                 </div>
                             </div>
