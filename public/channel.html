@@ -323,21 +323,23 @@
                 </div>
                 <div id="moderation-rules-container" style="display:none;">
                     <div class="form-group">
-                        <label>Luật kiểm duyệt (mỗi dòng một quy tắc, bằng tiếng Việt)</label>
+                        <label for="moderation-rules-text" id="label-moderation-rules">
+                            Luật kiểm duyệt (mỗi dòng một quy tắc, bằng tiếng Việt)
+                        </label>
                         <textarea id="moderation-rules-text" rows="4" placeholder="VD:
 - Không được chửi bậy, nói tục.
 - Cấm spam link quảng cáo.
 - Không được đăng ảnh bạo lực, khỏa thân.
 - ..."></textarea>
-                        <small class="text-muted">AI sẽ hiểu và áp dụng các quy tắc này.</small>
+                        <small id="moderation-rules-hint" class="text-muted">AI sẽ hiểu và áp dụng các quy tắc này.</small>
                     </div>
                     <div class="form-group">
-                        <label>Áp dụng kiểm duyệt cho:</label>
+                        <label id="label-moderation-types">Áp dụng kiểm duyệt cho:</label>
                         <div style="display:flex; gap:16px;">
-                            <label><input type="checkbox" id="moderate-text" checked> Text</label>
+                            <label><input type="checkbox" id="moderate-text" checked> Tin nhắn</label>
                             <label><input type="checkbox" id="moderate-image"> Ảnh</label>
                             <label><input type="checkbox" id="moderate-video"> Video</label>
-                            <label><input type="checkbox" id="moderate-file"> File</label>
+                            <label><input type="checkbox" id="moderate-file"> Tài liệu</label>
                         </div>
                     </div>
                     <div class="form-group">

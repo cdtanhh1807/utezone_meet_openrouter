@@ -468,7 +468,7 @@ let chatroomPollingTimer = null;
 
 var currentAIConversation = null;
 var aiConversationList = [];
-var documentAIMode = 'closed'; 
+var documentAIMode = 'closed';
 
 var avatarCache = {};
 async function getUserAvatar(email) {
@@ -2171,12 +2171,23 @@ async function applyMuteStatusForCurrentChannel() {
 // ====== Select Channel ======
 function updateOwnerControls() {
     const isOwner = currentChannel && currentChannel.is_owner;
+
     const createChatroomBtn = document.getElementById('btn-create-chatroom');
     const channelSettingsBtn = document.getElementById('btn-channel-settings');
     const chatroomSettingsBtn = document.getElementById('btn-chatroom-settings');
-    if (createChatroomBtn) createChatroomBtn.style.display = isOwner ? 'inline-flex' : 'none';
-    if (channelSettingsBtn) channelSettingsBtn.style.display = isOwner ? 'inline-flex' : 'none';
-    if (chatroomSettingsBtn) chatroomSettingsBtn.style.display = (isOwner && currentChatroom) ? 'inline-flex' : 'none';
+
+    if (createChatroomBtn) {
+        createChatroomBtn.style.display = isOwner ? 'inline-flex' : 'none';
+    }
+
+    // Thành viên vẫn được xem cài đặt kênh dạng chỉ đọc
+    if (channelSettingsBtn) {
+        channelSettingsBtn.style.display = currentChannel ? 'inline-flex' : 'none';
+    }
+
+    if (chatroomSettingsBtn) {
+        chatroomSettingsBtn.style.display = (isOwner && currentChatroom) ? 'inline-flex' : 'none';
+    }
 }
 
 async function selectChannel(channelId) {
@@ -3532,6 +3543,93 @@ let currentModerationSettings = {
     penalty_time: null
 };
 
+function updateChannelSettingsLabelsForRole(isReadonly) {
+    const rulesLabel = document.getElementById('label-moderation-rules');
+    const typesLabel = document.getElementById('label-moderation-types');
+
+    if (rulesLabel) {
+        rulesLabel.textContent = isReadonly
+            ? 'Luật của kênh'
+            : 'Luật kiểm duyệt (mỗi dòng một quy tắc, bằng tiếng Việt)';
+    }
+
+    if (typesLabel) {
+        typesLabel.textContent = isReadonly
+            ? 'Áp dụng luật cho:'
+            : 'Áp dụng kiểm duyệt cho:';
+    }
+}
+
+function setChannelSettingsReadonlyMode(isReadonly) {
+    const ownerOnlyIds = [
+        'input-edit-channel-name',
+        'input-edit-channel-desc',
+        'input-edit-require-approval',
+        'channel-avatar-preview',
+        'channel-avatar-placeholder',
+        'btn-upload-avatar',
+        'btn-remove-avatar',
+        'enable-moderation',
+        'moderation-action',
+        'max-violations',
+        'penalty-time',
+        'btn-submit-edit-channel',
+        'btn-delete-channel'
+    ];
+
+    ownerOnlyIds.forEach(id => {
+        const el = document.getElementById(id);
+        if (!el) return;
+
+        const group = el.closest('.form-group') || el.closest('.channel-avatar-section') || el.parentElement;
+
+        if (group) {
+            group.style.display = isReadonly ? 'none' : '';
+        } else {
+            el.style.display = isReadonly ? 'none' : '';
+        }
+    });
+
+    const moderationHeader = document.getElementById('moderation-settings-title');
+    if (moderationHeader) {
+        moderationHeader.style.display = isReadonly ? 'none' : '';
+    }
+
+    const moderationRulesHint = document.getElementById('moderation-rules-hint');
+    if (moderationRulesHint) {
+        moderationRulesHint.style.display = isReadonly ? 'none' : '';
+    }
+
+    const submitBtn = document.getElementById('btn-submit-edit-channel');
+    const deleteBtn = document.getElementById('btn-delete-channel');
+
+    if (submitBtn) submitBtn.style.display = isReadonly ? 'none' : 'inline-flex';
+    if (deleteBtn) deleteBtn.style.display = isReadonly ? 'none' : 'inline-flex';
+
+    const rulesTextarea = document.getElementById('moderation-rules-text');
+    if (rulesTextarea) {
+        rulesTextarea.disabled = isReadonly;
+        rulesTextarea.readOnly = isReadonly;
+    }
+
+    const moderateTypes = [
+        'moderate-text',
+        'moderate-image',
+        'moderate-video',
+        'moderate-file'
+    ];
+
+    moderateTypes.forEach(id => {
+        const el = document.getElementById(id);
+        if (el) el.disabled = isReadonly;
+    });
+
+    const modalTitle = document.querySelector('#modal-channel-settings .modal-header h3');
+    if (modalTitle) {
+        modalTitle.textContent = isReadonly ? 'Thông tin kênh' : 'Cài đặt kênh';
+    }
+}
+
 async function loadChannelRules() {
     if (!currentChannel) return;
     try {
@@ -3751,11 +3849,34 @@ document.getElementById('btn-submit-create-chatroom').addEventListener('click', 
 });
 document.getElementById('btn-channel-settings').addEventListener('click', () => {
     if (!currentChannel) return;
-    document.getElementById('input-edit-channel-name').value = currentChannel.name || '';
-    document.getElementById('input-edit-channel-desc').value = currentChannel.description || '';
-    document.getElementById('input-edit-require-approval').checked = currentChannel.require_approval || false;
-    document.getElementById('display-invite-code').textContent = currentChannel.invite_code || '-';
+
+    const isOwner = !!currentChannel.is_owner;
+    const isReadonly = !isOwner;
+
+    const nameInput = document.getElementById('input-edit-channel-name');
+    const descInput = document.getElementById('input-edit-channel-desc');
+    const requireApprovalInput = document.getElementById('input-edit-require-approval');
+    const inviteCodeEl = document.getElementById('display-invite-code');
+
+    if (nameInput) nameInput.value = currentChannel.name || '';
+    if (descInput) descInput.value = currentChannel.description || '';
+    if (requireApprovalInput) requireApprovalInput.checked = currentChannel.require_approval || false;
+    if (inviteCodeEl) inviteCodeEl.textContent = currentChannel.invite_code || '-';
+
     loadChannelAvatarPreview();
+
+    if (typeof loadChannelRules === 'function') {
+        loadChannelRules();
+    }
+
+    if (typeof setChannelSettingsReadonlyMode === 'function') {
+        setChannelSettingsReadonlyMode(isReadonly);
+    }
+
+    if (typeof updateChannelSettingsLabelsForRole === 'function') {
+        updateChannelSettingsLabelsForRole(isReadonly);
+    }
+
     document.getElementById('modal-channel-settings').style.display = 'flex';
 });
 document.getElementById('btn-delete-channel').addEventListener('click', () => {
