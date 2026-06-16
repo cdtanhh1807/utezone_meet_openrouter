@@ -6,6 +6,37 @@ function redirectToLogin() {
     var loginUrl = LOGIN_URL + '?redirect=' + encodeURIComponent(currentUrl);
     window.location.href = loginUrl;
 }
+
+function logoutMeetingSystem() {
+    try {
+        if (channelSocket) {
+            channelSocket.close(1000, 'logout');
+            channelSocket = null;
+        }
+
+        if (userSocket) {
+            userSocket.close(1000, 'logout');
+            userSocket = null;
+        }
+
+        stopPresencePing?.();
+        stopUserPing?.();
+
+        localStorage.removeItem('token');
+
+        sessionStorage.removeItem('lastVoiceChannel');
+        sessionStorage.removeItem('lastVoiceRoom');
+
+        window.location.href = 'http://localhost:5173/login';
+    } catch (err) {
+        console.error('Logout error:', err);
+
+        localStorage.removeItem('token');
+
+        window.location.href = 'http://localhost:5173/login';
+    }
+}
+
 var unreadChannelCounts = {};
 var fileUrlCache = {};
 
@@ -2298,7 +2329,22 @@ function renderChatroomList() {
     if (!chatroomList.length) { container.innerHTML = '<div class="empty-chatrooms">Chưa có phòng chat nào</div>'; return; }
     var textRooms = chatroomList.filter(r => r.room_type === 'text' || !r.room_type);
     var voiceRooms = chatroomList.filter(r => r.room_type === 'voice');
+    var aiRooms = chatroomList.filter(r => r.room_type === 'ai');
     var html = '';
+    if (aiRooms.length) {
+        html += '<div class="chatroom-group"><div class="chatroom-group-title"><i class="fas fa-robot"></i> UTEZoneAI</div>';
+
+        aiRooms.forEach(r => {
+            var isActive = currentChatroom && currentChatroom.room_id === r.room_id ? ' active' : '';
+
+            html += `<div class="chatroom-item${isActive}" onclick="selectChatroom('${r.room_id}')">
+                <span class="chatroom-item-icon"><i class="fas fa-robot"></i></span>
+                <span class="chatroom-item-name">${escapeHtml(r.name)}</span>
+            </div>`;
+        });
+
+        html += '</div>';
+    }
     if (textRooms.length) {
         html += '<div class="chatroom-group"><div class="chatroom-group-title"><i class="fas fa-hashtag"></i> Trò chuyện</div>';
         textRooms.forEach(r => {
@@ -2342,6 +2388,9 @@ function selectChatroom(roomId) {
         if (currentChatroom.room_type === 'voice') {
             stopMessagePolling();
             renderVoiceRoom();
+        } else if (currentChatroom.room_type === 'ai') {
+            stopMessagePolling();
+            renderChannelAIRoom();
         } else {
             refreshMessages();
         }
@@ -2391,6 +2440,114 @@ function renderVoiceRoom() {
     messagesContainer.innerHTML = '';
     var html = '<div class="voice-room"><div class="voice-room-header"><i class="fas fa-volume-up" style="font-size:48px;color:#323cae;"></i><h3>' + escapeHtml(currentChatroom.name) + '</h3><p>' + escapeHtml(currentChatroom.description || 'Phòng họp') + '</p></div><div class="voice-room-actions"><button class="btn-join-voice" id="btn-join-voice" onclick="joinVoiceRoom()"><i class="fas fa-headphones"></i> Tham gia họp</button></div></div>';
     messagesContainer.innerHTML = html;
+}
+
+function renderChannelAIRoom() {
+    var messagesContainer = document.getElementById('chatroom-messages');
+    var inputArea = document.querySelector('.chatroom-input-area');
+
+    if (!messagesContainer || !currentChannel) return;
+
+    if (inputArea) {
+        inputArea.style.display = 'flex';
+    }
+
+    messagesContainer.innerHTML = `
+        <div class="channel-ai-room">
+            <div class="channel-ai-welcome" id="channel-ai-welcome" style="display:none;">
+                <i class="fas fa-robot" style="font-size:48px;color:#323cae;"></i>
+                <h3>UTEZoneAI</h3>
+                <p>Nhập yêu cầu để quản trị kênh bằng ngôn ngữ tự nhiên.</p>
+                <div class="channel-ai-examples">
+                    <div>Ví dụ:</div>
+                    <code>Tạo phòng trò chuyện tên "Thảo luận dự án mới"</code>
+                    <code>Tạo phòng họp tên "Sprint Planning" và gửi mail cho tất cả thành viên</code>
+                    <code>Tìm tất cả thành viên trong kênh</code>
+                    <code>Tìm thành viên có email dạng @gmail.com</code>
+                </div>
+            </div>
+
+            <div id="channel-ai-messages" class="channel-ai-messages"></div>
+        </div>
+    `;
+
+    const input = document.getElementById('chat-message-input');
+    const sendBtn = document.getElementById('btn-send-message');
+    const attachBtn = document.getElementById('btn-attach-file');
+
+    if (input) {
+        input.placeholder = 'Ra lệnh cho UTEZoneAI...';
+        input.disabled = false;
+        input.readOnly = false;
+    }
+
+    if (sendBtn) {
+        sendBtn.disabled = false;
+        sendBtn.style.pointerEvents = '';
+        sendBtn.style.opacity = '';
+    }
+
+    if (attachBtn) {
+        attachBtn.style.display = 'none';
+    }
+
+    loadChannelAIMessages();
+}
+
+async function loadChannelAIMessages() {
+    if (!currentChannel) return;
+
+    try {
+        const data = await apiCall(`/channels/${currentChannel.channel_id}/ai/messages`);
+        const messages = data.messages || [];
+
+        const container = document.getElementById('channel-ai-messages');
+        const welcome = document.getElementById('channel-ai-welcome');
+
+        if (!container) return;
+
+        container.innerHTML = '';
+
+        if (welcome) {
+            welcome.style.display = messages.length === 0 ? 'block' : 'none';
+        }
+
+        messages.forEach(msg => {
+            appendChannelAIMessage(msg.role, msg.content);
+        });
+    } catch (err) {
+        console.error('Load channel AI messages error:', err);
+        showToast('Không tải được lịch sử UTEZoneAI', 'error');
+    }
+}
+
+function appendChannelAIMessage(role, content) {
+    const container = document.getElementById('channel-ai-messages');
+    if (!container) return;
+
+    const welcome = document.getElementById('channel-ai-welcome');
+    if (welcome) {
+        welcome.style.display = 'none';
+    }
+
+    const isUser = role === 'user';
+
+    const div = document.createElement('div');
+    div.className = isUser ? 'channel-ai-msg user' : 'channel-ai-msg assistant';
+
+    const roleDiv = document.createElement('div');
+    roleDiv.className = 'channel-ai-msg-role';
+    roleDiv.textContent = isUser ? 'Bạn' : 'UTEZoneAI';
+
+    const contentDiv = document.createElement('div');
+    contentDiv.className = 'channel-ai-msg-content';
+    contentDiv.textContent = content || '';
+
+    div.appendChild(roleDiv);
+    div.appendChild(contentDiv);
+
+    container.appendChild(div);
+    container.scrollTop = container.scrollHeight;
 }
 
 var isInVoiceRoom = false;
@@ -3975,28 +4132,112 @@ async function getUserFullName() {
         return cachedFullName;
     } catch (e) { console.error("Lỗi lấy fullName:", e); const email = getCurrentUserEmail(); cachedFullName = email.split('@')[0]; return cachedFullName; }
 }
+
+async function sendChannelAICommand(message) {
+    if (!currentChannel || !currentChatroom) return;
+
+    const input = document.getElementById('chat-message-input');
+    const sendBtn = document.getElementById('btn-send-message');
+
+    appendChannelAIMessage('user', message);
+
+    if (input) {
+        input.value = '';
+        input.disabled = true;
+    }
+
+    if (sendBtn) {
+        sendBtn.disabled = true;
+        sendBtn.style.opacity = '0.5';
+    }
+
+    appendChannelAIMessage('assistant', 'Đang xử lý yêu cầu...');
+
+    try {
+        const data = await apiCall(
+            `/channels/${currentChannel.channel_id}/ai/ask`,
+            'POST',
+            { message }
+        );
+
+        const container = document.getElementById('channel-ai-messages');
+
+        if (container) {
+            const loadingMsgs = container.querySelectorAll('.channel-ai-msg.assistant');
+            const last = loadingMsgs[loadingMsgs.length - 1];
+
+            if (
+                last &&
+                last.innerText.includes('Đang xử lý yêu cầu')
+            ) {
+                last.remove();
+            }
+        }
+
+        appendChannelAIMessage('assistant', data.reply || 'Đã xử lý xong.');
+
+        await loadChatrooms(currentChannel.channel_id);
+
+    } catch (err) {
+        console.error('Channel AI command error:', err);
+        appendChannelAIMessage(
+            'assistant',
+            err.message || 'UTEZoneAI xử lý thất bại.'
+        );
+    } finally {
+        if (input) {
+            input.disabled = false;
+            input.focus();
+        }
+
+        if (sendBtn) {
+            sendBtn.disabled = false;
+            sendBtn.style.opacity = '';
+        }
+    }
+}
+
 async function sendMessage() {
     var input = document.getElementById('chat-message-input');
 
+    if (!input) return;
+
+    var content = input.value.trim();
+
+    if (!content || !currentChatroom) return;
+
+    // =========================
+    // UTEZoneAI room
+    // =========================
+    // Phòng UTEZoneAI không gửi message theo flow chat thường.
+    // Nó sẽ gọi API /channels/{channel_id}/ai/ask.
+    if (currentChatroom.room_type === 'ai') {
+        sendChannelAICommand(content);
+        return;
+    }
+
+    // =========================
+    // Normal text room
+    // =========================
     if (isMutedInCurrentChannel()) {
         syncMuteControls();
         showMutedToast();
         return;
     }
 
-    if (input && input.disabled) {
+    if (input.disabled) {
         syncMuteControls();
         showMutedToast();
         return;
     }
 
-    var content = input.value.trim();
-
-    if (!content || !currentChatroom) return;
     input.value = '';
+
     const fullName = await getUserFullName();
     const userEmail = getCurrentUserEmail();
+
     const tempId = 'temp_' + Date.now() + '_' + Math.random();
+
     const tempMsg = {
         message_id: tempId,
         room_id: currentChatroom.room_id,
@@ -4007,28 +4248,44 @@ async function sendMessage() {
         msg_type: 'text',
         created_at: new Date().toISOString()
     };
+
     messageList.push(tempMsg);
     appendNewMessages([tempMsg]);
+
     try {
-        const realMsg = await apiCall(`/channels/chatrooms/${currentChatroom.room_id}/messages`, 'POST', { content: content });
+        const realMsg = await apiCall(
+            `/channels/chatrooms/${currentChatroom.room_id}/messages`,
+            'POST',
+            { content: content }
+        );
+
         const index = messageList.findIndex(m => m.message_id === tempId);
+
         if (index !== -1) {
             messageList[index] = realMsg;
+
             const msgDiv = document.querySelector(`.message-item[data-temp-id="${tempId}"]`);
+
             if (msgDiv) {
                 msgDiv.setAttribute('data-message-id', realMsg.message_id);
                 msgDiv.removeAttribute('data-temp-id');
+
                 const timeSpan = msgDiv.querySelector('.message-time');
-                if (timeSpan) timeSpan.textContent = formatTime(realMsg.created_at);
+                if (timeSpan) {
+                    timeSpan.textContent = formatTime(realMsg.created_at);
+                }
             }
         }
     } catch (err) {
         const index = messageList.findIndex(m => m.message_id === tempId);
+
         if (index !== -1) {
             messageList.splice(index, 1);
+
             const msgDiv = document.querySelector(`.message-item[data-temp-id="${tempId}"]`);
             if (msgDiv) msgDiv.remove();
         }
+
         const detail = err.data?.detail;
 
         if (err.status === 403 && detail?.error === 'muted') {
@@ -4359,3 +4616,7 @@ setTimeout(() => {
     handleInviteLinkJoin();
 }, 300);
 setTimeout(handleUrlSelection, 500);
+
+document.getElementById('btn-logout')?.addEventListener('click', function () {
+    logoutMeetingSystem();
+});
