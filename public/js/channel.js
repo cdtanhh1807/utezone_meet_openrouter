@@ -1772,7 +1772,7 @@ function renderAIConversationList() {
     if (!aiConversationList.length) {
         listEl.innerHTML = `
             <div class="document-ai-empty">
-                Chưa có cuộc trò chuyện nào với UTEZoneAI trong room này.
+                Chưa có cuộc trò chuyện nào trong phòng này.
             </div>
         `;
         return;
@@ -3312,7 +3312,7 @@ function renderMemberItem(m) {
         </div>
     `;
 }
-function viewProfile(email) { window.open(`http://localhost:5173/profile/${encodeURIComponent(email)}`, '_blank'); }
+function viewProfile(email) { window.open(`http://localhost:5173/profile/${email}`, '_blank'); }
 function approveMember(memberEmail) {
     if (!currentChannel || !currentChannel.is_owner) {
         showToast('Bạn không có quyền phê duyệt thành viên', 'error');
