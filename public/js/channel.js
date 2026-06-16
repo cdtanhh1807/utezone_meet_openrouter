@@ -1,4 +1,3 @@
-// channel.js hoàn chỉnh (sao chép toàn bộ nội dung này)
 const API_URL = 'http://localhost:8000';
 const LOGIN_URL = 'http://localhost:5173/login';
 

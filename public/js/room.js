@@ -49,18 +49,64 @@ console.log('[room.js] Redirect params:', { channelId, chatroomId });
 
 let micAllowed = 1;
 let camAllowed = 1;
-let videoAllowed = 1;
-let audioAllowed = 1;
+let videoAllowed = 0;
+let audioAllowed = 0;
+
+let hasCameraDevice = false;
+let hasMicrophoneDevice = false;
+
 let screenshareEnabled = false;
 let boardVisisble = false;
 let mystream = null;
 let myCameraStream = null;
 let myScreenTrack = null;
 const peers = {};
-const pendingScreenSharePeers = new Set(); // track peers awaiting answer after screen share renegotiate
+const peerAudioTransceivers = {};
+const peerVideoTransceivers = {};
+const peerAudioSenders = {};
+const peerVideoSenders = {};
+const pendingScreenSharePeers = new Set();
+const pendingInitialMediaSyncPeers = new Set();
+
+function getCurrentOutgoingVideoTrack() {
+    // Ưu tiên screen share nếu đang share
+    if (
+        screenshareEnabled &&
+        myScreenTrack &&
+        myScreenTrack.readyState === 'live'
+    ) {
+        return myScreenTrack;
+    }
+
+    // Sau đó mới tới camera
+    const cameraTrack =
+        myCameraStream?.getVideoTracks?.()[0] ||
+        mystream?.getVideoTracks?.()[0] ||
+        null;
+
+    if (cameraTrack && cameraTrack.readyState === 'live') {
+        return cameraTrack;
+    }
+
+    return null;
+}
+
+function isCurrentlySendingScreenShare() {
+    return (
+        screenshareEnabled &&
+        myScreenTrack &&
+        myScreenTrack.readyState === 'live'
+    );
+}
+
+function getAdvertisedVideoState() {
+    // Khi đang share màn hình, remote phải hiểu là đang có video để không hiện Video Off / không tự dừng UI share.
+    return !!videoAllowed || isCurrentlySendingScreenShare();
+}
 
 const activeScreenShares = {};
 let viewingScreenShare = null;
+const remoteStreams = {};
 let isHost = false;
 let roomType = 'instant';
 let ws = null;
@@ -183,7 +229,13 @@ function initWebSocket() {
 
     ws = new WebSocket(`${WS_URL}/ws/meeting/${roomid}?token=${token}`);
 
-    ws.onopen = () => console.log('Connected to meeting server');
+    ws.onopen = () => {
+        console.log('Connected to meeting server');
+
+        setTimeout(() => {
+            notifyMyMediaState();
+        }, 1000);
+    };
 
     ws.onclose = () => {
         console.log('Disconnected');
@@ -252,8 +304,6 @@ function initWebSocket() {
                 ctx.clearRect(0, 0, canvas.width, canvas.height);
                 break;
             case 'room_ended':
-                alert(`Host đã kết thúc cuộc họp.\nĐã xóa ${data.deleted_files || 0} file.`);
-                // location.href = '/';
                 const savedChannel = sessionStorage.getItem('lastVoiceChannel');
                 const savedChatroom = sessionStorage.getItem('lastVoiceRoom');
                 if (savedChannel && savedChatroom) {
@@ -275,43 +325,147 @@ async function createPeerConnection(targetEmail, isInitiator) {
     const pc = new RTCPeerConnection(configuration);
     peers[targetEmail] = pc;
 
-    if (mystream) {
-        mystream.getTracks().forEach(track => pc.addTrack(track, mystream));
+    const localAudioTrack = mystream ? mystream.getAudioTracks()[0] : null;
+    const localVideoTrack = mystream ? mystream.getVideoTracks()[0] : null;
+
+    if (localAudioTrack) {
+        localAudioTrack.enabled = !!audioAllowed;
+    }
+
+    if (localVideoTrack) {
+        localVideoTrack.enabled = !!videoAllowed;
+    }
+
+    if (localAudioTrack) {
+        const audioTransceiver = pc.addTransceiver(localAudioTrack, {
+            direction: 'sendrecv'
+        });
+        peerAudioTransceivers[targetEmail] = audioTransceiver;
+        peerAudioSenders[targetEmail] = audioTransceiver.sender;
+    } else {
+        const audioTransceiver = pc.addTransceiver('audio', {
+            direction: 'recvonly'
+        });
+        peerAudioTransceivers[targetEmail] = audioTransceiver;
+        peerAudioSenders[targetEmail] = audioTransceiver.sender;
+    }
+
+    if (localVideoTrack) {
+        const videoTransceiver = pc.addTransceiver(localVideoTrack, {
+            direction: 'sendrecv'
+        });
+        peerVideoTransceivers[targetEmail] = videoTransceiver;
+        peerVideoSenders[targetEmail] = videoTransceiver.sender;
+    } else {
+        const videoTransceiver = pc.addTransceiver('video', {
+            direction: 'recvonly'
+        });
+        peerVideoTransceivers[targetEmail] = videoTransceiver;
+        peerVideoSenders[targetEmail] = videoTransceiver.sender;
     }
 
     // QUAN TRỌNG: Lưu trữ stream hiện tại để so sánh
     let lastStreamId = null;
 
     pc.ontrack = (event) => {
-        const stream = event.streams[0];
-        if (!stream) return;
+        let stream = event.streams && event.streams[0] ? event.streams[0] : null;
 
-        console.log(`[ontrack] from=${targetEmail} streamId=${stream.id} trackId=${event.track.id} kind=${event.track.kind}`);
+        // Với addTransceiver(), nhiều browser không có event.streams[0].
+        // Khi đó tự tạo MediaStream theo email và add track vào.
+        if (!stream) {
+            stream = getOrCreateRemoteStream(targetEmail);
 
-        if (stream.id !== lastStreamId) {
-            lastStreamId = stream.id;
-            const existingContainer = document.getElementById(`video-${targetEmail}`);
-            if (existingContainer) {
-                const video = existingContainer.querySelector('video');
-                if (video) { video.srcObject = null; video.srcObject = stream; }
-            } else {
-                createRemoteVideoElement(targetEmail, stream);
+            const alreadyHasTrack = stream.getTracks().some(t => t.id === event.track.id);
+            if (!alreadyHasTrack) {
+                stream.addTrack(event.track);
             }
+        } else {
+            remoteStreams[targetEmail] = stream;
         }
+
+        console.log(
+            `[ontrack] from=${targetEmail} streamId=${stream.id} trackId=${event.track.id} kind=${event.track.kind}`
+        );
+
+        event.track.onended = () => {
+            console.log(`[Track ended] from=${targetEmail}, kind=${event.track.kind}`);
+
+            if (event.track.kind === 'video' && activeScreenShares[targetEmail]) {
+                cleanupScreenShareForLeftUser(targetEmail, 'remote video track ended');
+            }
+        };
+
+        event.track.onmute = () => {
+            console.log(`[Track muted] from=${targetEmail}, kind=${event.track.kind}`);
+
+            if (event.track.kind === 'video' && activeScreenShares[targetEmail]) {
+                setTimeout(() => {
+                    const stillActive = activeScreenShares[targetEmail];
+                    const pcStillExists = !!peers[targetEmail];
+
+                    if (stillActive && !pcStillExists) {
+                        cleanupScreenShareForLeftUser(targetEmail, 'remote video track muted and peer gone');
+                    }
+                }, 800);
+            }
+        };
+
+        attachRemoteStreamToVideo(targetEmail, stream);
+
+        event.track.onunmute = () => {
+            attachRemoteStreamToVideo(targetEmail, stream);
+
+            if (activeScreenShares[targetEmail]) {
+                const name = participantInfo[targetEmail]?.displayName || targetEmail;
+
+                activeScreenShares[targetEmail] = {
+                    ...activeScreenShares[targetEmail],
+                    name,
+                    stream
+                };
+
+                const videoBox = document.getElementById(`video-${targetEmail}`);
+                if (videoBox) {
+                    videoBox.style.display = 'none';
+                }
+
+                if (!viewingScreenShare || viewingScreenShare === targetEmail) {
+                    viewingScreenShare = targetEmail;
+                    showScreenShareMain(stream, name);
+                }
+
+                updateScreenShareSelector();
+            }
+        };
+
+        if (activeScreenShares[targetEmail]) {
+            const name = participantInfo[targetEmail]?.displayName || targetEmail;
+
+            activeScreenShares[targetEmail] = {
+                ...activeScreenShares[targetEmail],
+                name,
+                stream
+            };
+
+            const videoBox = document.getElementById(`video-${targetEmail}`);
+            if (videoBox) {
+                videoBox.style.display = 'none';
+            }
+
+            if (!viewingScreenShare || viewingScreenShare === targetEmail) {
+                viewingScreenShare = targetEmail;
+                showScreenShareMain(stream, name);
+            }
+
+            updateScreenShareSelector();
+        }
+
+        updateVideoLayoutByUserCount();
     };
 
     // Khi track thay đổi (replaceTrack), trigger re-offer để remote nhận ontrack mới
-    pc.onnegotiationneeded = async () => {
-        console.log(`[negotiationneeded] ${targetEmail}`);
-        if (!isInitiator) return; // Chỉ initiator mới tạo offer
-        try {
-            const offer = await pc.createOffer();
-            await pc.setLocalDescription(offer);
-            ws.send(JSON.stringify({ type: 'offer', target: targetEmail, offer }));
-            console.log(`[Renegotiate] Sent new offer to ${targetEmail}`);
-        } catch (e) {
-            console.error('[Renegotiate] Error:', e);
-        }
+    pc.onnegotiationneeded = () => {
+        console.log(`[negotiationneeded ignored] ${targetEmail}`);
     };
 
     pc.onicecandidate = (event) => {
@@ -325,10 +479,17 @@ async function createPeerConnection(targetEmail, isInitiator) {
     };
 
     pc.onconnectionstatechange = () => {
+        console.log(`[PC] ${targetEmail} connectionState=${pc.connectionState}`);
+
         if (pc.connectionState === 'connected') {
             startScreenShareMonitor(targetEmail, pc);
         }
-        if (pc.connectionState === 'disconnected' || pc.connectionState === 'failed') {
+
+        if (
+            pc.connectionState === 'disconnected' ||
+            pc.connectionState === 'failed' ||
+            pc.connectionState === 'closed'
+        ) {
             removeRemoteVideo(targetEmail);
         }
     };
@@ -348,11 +509,45 @@ async function createPeerConnection(targetEmail, isInitiator) {
 
 async function handleOffer(data) {
     const pc = await createPeerConnection(data.from, false);
+
     try {
+        // Tránh xử lý offer khi peer đang ở trạng thái không phù hợp
+        if (pc.signalingState !== 'stable') {
+            console.warn(`[handleOffer ignored] from=${data.from}, state=${pc.signalingState}`);
+            return;
+        }
+
         await pc.setRemoteDescription(new RTCSessionDescription(data.offer));
+
         const answer = await pc.createAnswer();
         await pc.setLocalDescription(answer);
-        ws.send(JSON.stringify({ type: 'answer', target: data.from, answer }));
+
+        ws.send(JSON.stringify({
+            type: 'answer',
+            target: data.from,
+            answer
+        }));
+
+        console.log(`[handleOffer] answered to ${data.from}`);
+        if (pendingInitialMediaSyncPeers.has(data.from)) {
+            pendingInitialMediaSyncPeers.delete(data.from);
+
+            setTimeout(async () => {
+                await syncOutgoingMediaToPeer(data.from, 'initial media sync for new peer');
+
+                if (isCurrentlySendingScreenShare()) {
+                    ws.send(JSON.stringify({
+                        type: 'screen_share_started',
+                        sender_email: userEmail,
+                        email: userEmail,
+                        target: data.from
+                    }));
+                }
+            }, 300);
+        }
+
+        // Không gọi syncOutgoingMediaToPeer ở đây nữa.
+        // Nếu gọi ở đây sẽ tạo offer ngược lại ngay sau answer, gây loạn SDP.
     } catch (e) {
         console.error('Error handling offer:', e);
     }
@@ -360,25 +555,36 @@ async function handleOffer(data) {
 
 async function handleAnswer(data) {
     const pc = peers[data.from];
-    if (pc) {
-        try {
-            await pc.setRemoteDescription(new RTCSessionDescription(data.answer));
-            console.log(`[handleAnswer] from=${data.from}`);
 
-            // Kiểm tra nếu đây là answer sau screen share renegotiation
-            if (pendingScreenSharePeers.has(data.from)) {
-                pendingScreenSharePeers.delete(data.from);
-                console.log(`[ScreenShare] Got answer from ${data.from}, pending=${pendingScreenSharePeers.size}`);
+    if (!pc) return;
 
-                // Gửi signal sau khi TẤT CẢ peers đã trả lời
-                if (pendingScreenSharePeers.size === 0 && screenshareEnabled) {
-                    console.log('[ScreenShare] All peers answered, sending screen_share_started signal');
-                    ws.send(JSON.stringify({ type: 'screen_share_started', sender_email: userEmail }));
-                }
-            }
-        } catch (e) {
-            console.error('Error handling answer:', e);
+    try {
+        // Chỉ được set remote answer khi mình đang chờ answer
+        if (pc.signalingState !== 'have-local-offer') {
+            console.warn(`[handleAnswer ignored] from=${data.from}, state=${pc.signalingState}`);
+            return;
         }
+
+        await pc.setRemoteDescription(new RTCSessionDescription(data.answer));
+
+        console.log(`[handleAnswer] from=${data.from}`);
+
+        if (pendingScreenSharePeers.has(data.from)) {
+            pendingScreenSharePeers.delete(data.from);
+            console.log(`[ScreenShare] Got answer from ${data.from}, pending=${pendingScreenSharePeers.size}`);
+
+            if (pendingScreenSharePeers.size === 0 && screenshareEnabled) {
+                console.log('[ScreenShare] All peers answered, sending screen_share_started signal');
+
+                ws.send(JSON.stringify({
+                    type: 'screen_share_started',
+                    sender_email: userEmail,
+                    email: userEmail
+                }));
+            }
+        }
+    } catch (e) {
+        console.error('Error handling answer:', e);
     }
 }
 
@@ -393,19 +599,113 @@ async function handleICECandidate(data) {
     }
 }
 
+async function renegotiatePeer(peerEmail, reason = '') {
+    const pc = peers[peerEmail];
+    if (!pc) return;
+
+    if (pc.signalingState !== 'stable') {
+        console.warn(`[Renegotiate skipped] ${peerEmail}, state=${pc.signalingState}, reason=${reason}`);
+        return;
+    }
+
+    try {
+        const offer = await pc.createOffer();
+        await pc.setLocalDescription(offer);
+
+        ws.send(JSON.stringify({
+            type: 'offer',
+            target: peerEmail,
+            offer
+        }));
+
+        console.log(`[Renegotiate] ${reason} -> ${peerEmail}`);
+    } catch (e) {
+        console.error(`[Renegotiate error] ${reason} -> ${peerEmail}:`, e);
+    }
+}
+
+async function syncOutgoingMediaToPeer(peerEmail, reason = '') {
+    const pc = peers[peerEmail];
+    if (!pc) return;
+
+    const audioTrack = mystream ? mystream.getAudioTracks()[0] : null;
+    const outgoingVideoTrack = getCurrentOutgoingVideoTrack();
+
+    const audioTransceiver = peerAudioTransceivers[peerEmail];
+    const videoTransceiver = peerVideoTransceivers[peerEmail];
+
+    try {
+        if (audioTransceiver) {
+            if (audioTrack) {
+                audioTrack.enabled = !!audioAllowed;
+                audioTransceiver.direction = 'sendrecv';
+                await audioTransceiver.sender.replaceTrack(audioTrack);
+            } else {
+                audioTransceiver.direction = 'recvonly';
+                await audioTransceiver.sender.replaceTrack(null);
+            }
+        }
+
+        if (videoTransceiver) {
+            if (outgoingVideoTrack) {
+                // Nếu là màn hình share thì luôn bật track.
+                // Nếu là camera thì phụ thuộc videoAllowed.
+                if (outgoingVideoTrack === myScreenTrack) {
+                    outgoingVideoTrack.enabled = true;
+                } else {
+                    outgoingVideoTrack.enabled = !!videoAllowed;
+                }
+
+                videoTransceiver.direction = 'sendrecv';
+                await videoTransceiver.sender.replaceTrack(outgoingVideoTrack);
+            } else {
+                videoTransceiver.direction = 'recvonly';
+                await videoTransceiver.sender.replaceTrack(null);
+            }
+        }
+
+        notifyMyMediaState();
+
+        if (pc.signalingState === 'stable') {
+            await renegotiatePeer(peerEmail, reason);
+        } else {
+            setTimeout(() => {
+                if (peers[peerEmail]?.signalingState === 'stable') {
+                    renegotiatePeer(peerEmail, `${reason} delayed`);
+                }
+            }, 700);
+        }
+    } catch (e) {
+        console.error(`[syncOutgoingMediaToPeer] ${peerEmail} ${reason}:`, e);
+    }
+}
+
 function updateVideoNameTag(email) {
     const container = document.getElementById(`video-${email}`);
     if (!container) return;
+
     const nameTag = container.querySelector('.nametag');
-    const info = participantInfo[email];
-    if (nameTag && info) {
-        nameTag.innerHTML = info.displayName;
+
+    if (nameTag) {
+        nameTag.innerHTML = getDisplayNameWithHostIcon(email, false);
     }
 }
 
 function createRemoteVideoElement(email, stream) {
-    let info = participantInfo[email];
-    let displayText = info ? info.displayName : email;
+    let displayText = getDisplayNameWithHostIcon(email, false);
+
+    let existing = document.getElementById(`video-${email}`);
+    if (existing) {
+        const video = existing.querySelector('video');
+        if (video && stream) {
+            video.srcObject = stream;
+            video.play().catch(console.warn);
+        }
+
+        updateVideoNameTag(email);
+        updateVideoLayoutByUserCount();
+        return existing;
+    }
 
     const vidCont = document.createElement('div');
     vidCont.id = `video-${email}`;
@@ -415,7 +715,11 @@ function createRemoteVideoElement(email, stream) {
     newvideo.className = 'video-frame';
     newvideo.autoplay = true;
     newvideo.playsinline = true;
-    newvideo.srcObject = stream;
+
+    if (stream) {
+        newvideo.srcObject = stream;
+        newvideo.play().catch(console.warn);
+    }
 
     const nameTag = document.createElement('div');
     nameTag.className = 'nametag';
@@ -425,13 +729,15 @@ function createRemoteVideoElement(email, stream) {
     muteIcon.className = 'mute-icon';
     muteIcon.id = `mute-${email}`;
     muteIcon.innerHTML = '<i class="fas fa-microphone-slash"></i>';
-    muteIcon.style.visibility = 'hidden';
+
+    // Mặc định remote đang tắt mic/cam cho tới khi nhận media_toggle
+    muteIcon.style.visibility = 'visible';
 
     const videoOff = document.createElement('div');
     videoOff.className = 'video-off';
     videoOff.id = `vidoff-${email}`;
     videoOff.innerHTML = 'Video Off';
-    videoOff.style.visibility = 'hidden';
+    videoOff.style.visibility = 'visible';
 
     vidCont.appendChild(newvideo);
     vidCont.appendChild(nameTag);
@@ -442,17 +748,54 @@ function createRemoteVideoElement(email, stream) {
 
     setTimeout(() => updateVideoNameTag(email), 100);
     updateVideoLayoutByUserCount();
+
+    return vidCont;
+}
+
+function getOrCreateRemoteStream(email) {
+    if (!remoteStreams[email]) {
+        remoteStreams[email] = new MediaStream();
+    }
+    return remoteStreams[email];
+}
+
+function attachRemoteStreamToVideo(email, stream) {
+    const existingContainer = document.getElementById(`video-${email}`);
+
+    if (existingContainer) {
+        const video = existingContainer.querySelector('video');
+
+        if (video && video.srcObject !== stream) {
+            video.srcObject = stream;
+            video.play().catch(console.warn);
+        }
+    } else {
+        createRemoteVideoElement(email, stream);
+    }
 }
 
 function removeRemoteVideo(email) {
+    // Quan trọng: dọn screen share trước khi xóa remoteStreams/video element.
+    // Nếu xóa stream trước, vùng screenshare-main vẫn giữ srcObject cũ và thành khung đen.
+    cleanupScreenShareForLeftUser(email, 'removeRemoteVideo');
+
     const elem = document.getElementById(`video-${email}`);
     if (elem) elem.remove();
+
     if (peers[email]) {
         peers[email].close();
         delete peers[email];
     }
+
+    delete peerAudioTransceivers[email];
+    delete peerVideoTransceivers[email];
+    delete peerAudioSenders[email];
+    delete peerVideoSenders[email];
+    delete remoteStreams[email];
+
     delete participantInfo[email];
-    removeScreenShare(email);
+
+    updateScreenShareSelector();
     updateVideoLayoutByUserCount();
 }
 
@@ -536,11 +879,22 @@ function getScreenShareContainer() {
 }
 
 function showScreenShareMain(stream, name) {
+    if (!stream || stream.getVideoTracks().length === 0) {
+        console.warn('[ScreenShare] Không có video track để hiển thị:', name);
+        return;
+    }
+
     const cont = getScreenShareContainer();
     cont.style.display = 'block';
 
     const video = document.getElementById('screenshare-video');
+    video.srcObject = null;
     video.srcObject = stream;
+
+    video.onloadedmetadata = () => {
+        video.play().catch(console.warn);
+    };
+
     video.play().catch(console.warn);
 
     document.getElementById('screenshare-label').textContent = `🖥️ ${name} đang chia sẻ màn hình`;
@@ -696,9 +1050,13 @@ function updateScreenShareSelector() {
 
     sharers.forEach(email => {
         if (email === userEmail) return;
+
+        if (!activeScreenShares[email]) return;
+
         const videoBox = document.getElementById(`video-${email}`);
         const vid = videoBox?.querySelector('video');
-        if (vid?.srcObject) {
+
+        if (vid?.srcObject && activeScreenShares[email]) {
             activeScreenShares[email].stream = vid.srcObject;
         }
     });
@@ -765,59 +1123,6 @@ function updateScreenShareSelector() {
         selector.appendChild(btn);
     });
 
-    // Nút dừng tất cả - chỉ host mới thấy
-    // if (isHost && sharers.length > 0) {
-    //     const stopAllBtn = document.createElement('button');
-    //     stopAllBtn.innerHTML = '🛑 Dừng tất cả';
-    //     stopAllBtn.style.cssText = `
-    //         padding: 6px 14px;
-    //         border-radius: 24px;
-    //         border: 1px solid #e74c3c;
-    //         background: transparent;
-    //         color: #e74c3c;
-    //         font-size: 12px;
-    //         cursor: pointer;
-    //         transition: all 0.2s;
-    //         margin-left: auto;
-    //     `;
-    //     stopAllBtn.onmouseenter = () => {
-    //         stopAllBtn.style.background = '#e74c3c';
-    //         stopAllBtn.style.color = '#fff';
-    //     };
-    //     stopAllBtn.onmouseleave = () => {
-    //         stopAllBtn.style.background = 'transparent';
-    //         stopAllBtn.style.color = '#e74c3c';
-    //     };
-    //     stopAllBtn.addEventListener('click', () => {
-    //         if (confirm('Dừng tất cả màn hình đang chia sẻ?')) {
-    //             // Gửi lệnh dừng trực tiếp đến từng user đang share (không qua server)
-    //             Object.keys(activeScreenShares).forEach(email => {
-    //                 if (email !== userEmail) {
-    //                     // Gửi trực tiếp qua WebSocket đến user đó
-    //                     ws.send(JSON.stringify({
-    //                         type: 'force_stop_screenshare',
-    //                         target: email
-    //                     }));
-    //                 }
-    //             });
-
-    //             // Nếu chính host đang share thì cũng dừng
-    //             if (screenshareEnabled) {
-    //                 stopScreenShare();
-    //             }
-
-    //             // Hiển thị thông báo
-    //             chatRoom.innerHTML += `
-    //         <div class="message system" style="text-align:center;color:#e74c3c;font-style:italic;">
-    //             <small>👑 Host đã dừng tất cả màn hình đang chia sẻ</small>
-    //         </div>
-    //     `;
-    //             chatRoom.scrollTop = chatRoom.scrollHeight;
-    //         }
-    //     });
-    //     selector.appendChild(stopAllBtn);
-    // }
-
     const cont = document.getElementById('screenshare-main');
     if (cont?.parentNode) {
         const existingSelector = cont.parentNode.querySelector('#screenshare-selector');
@@ -875,6 +1180,7 @@ function checkAndShowScreenShare(email, stream) {
 
 // Monitor peer connection bằng getStats để detect khi frame size thay đổi (screen share)
 const screenShareMonitors = {};
+const recentlyStoppedScreenShares = {};
 
 function startScreenShareMonitor(email, pc) {
     if (screenShareMonitors[email]) return; // đã chạy rồi
@@ -919,6 +1225,10 @@ function startScreenShareMonitor(email, pc) {
             }
 
             if (isScreenRes) {
+                if (recentlyStoppedScreenShares[email] && Date.now() - recentlyStoppedScreenShares[email] < 5000) {
+                    return;
+                }
+
                 consecutiveCameraFrames = 0;
                 consecutiveScreenFrames++;
                 if (consecutiveScreenFrames >= THRESHOLD && !wasScreen) {
@@ -975,8 +1285,9 @@ function startScreenShareMonitor(email, pc) {
 // =================== REMOTE SCREEN SHARE HANDLING ===================
 
 function handleRemoteScreenShareStarted(data) {
-    const email = data.sender_email || data.email || data.from;
-    console.log('[Remote] Screen share started from:', email, 'active shares:', Object.keys(activeScreenShares).length);
+    const email = getParticipantEmail(data);
+
+    console.log('[Remote] Screen share started from:', email);
 
     if (!email) {
         console.error('[Remote] Cannot determine sender email from:', JSON.stringify(data));
@@ -984,102 +1295,117 @@ function handleRemoteScreenShareStarted(data) {
     }
 
     const name = participantInfo[email]?.displayName || email;
+    const alreadyKnownScreenShare = !!activeScreenShares[email];
+
+    const videoEl = document.getElementById(`video-${email}`)?.querySelector('video');
+
+    const stream =
+        remoteStreams[email] ||
+        videoEl?.srcObject ||
+        null;
 
     activeScreenShares[email] = {
-        name: name,
-        startedAt: Date.now()
+        name,
+        startedAt: Date.now(),
+        stream
     };
 
     if (!viewingScreenShare || !activeScreenShares[viewingScreenShare]) {
         viewingScreenShare = email;
     }
 
-    function tryShowFromVideoElement() {
-        const videoBox = document.getElementById(`video-${email}`);
-        if (!videoBox) return false;
-        const vid = videoBox.querySelector('video');
-        if (!vid || !vid.srcObject) return false;
+    const videoBox = document.getElementById(`video-${email}`);
 
-        console.log(`[Remote] Taking stream from video element for ${email}`);
+    if (stream && stream.getVideoTracks().length > 0) {
+        const liveVideoTrack = stream.getVideoTracks().find(t => t.readyState === 'live');
 
-        activeScreenShares[email].stream = vid.srcObject;
-        videoBox.style.display = 'none';
+        if (!liveVideoTrack) {
+            console.warn(`[ScreenShare] Có stream nhưng chưa có video track live từ ${email}`);
+        }
+
+        if (videoBox) {
+            videoBox.style.display = 'none';
+        }
 
         if (viewingScreenShare === email) {
-            showScreenShareMain(vid.srcObject, name);
+            showScreenShareMain(stream, name);
         }
 
         updateScreenShareSelector();
-        return true;
     }
 
-    if (tryShowFromVideoElement()) return;
-
-    let checks = 0;
-    const interval = setInterval(() => {
-        if (tryShowFromVideoElement()) {
-            clearInterval(interval);
-            return;
-        }
-        if (++checks >= 50) {
-            clearInterval(interval);
-            console.warn(`[Remote] Timeout: no stream for ${email}`);
-        }
-    }, 100);
-
-    chatRoom.innerHTML += `
+    if (!alreadyKnownScreenShare) {
+        chatRoom.innerHTML += `
         <div class="message system" style="text-align:center;color:#4caf50;font-style:italic;">
             <small>🖥️ ${name} đang chia sẻ màn hình</small>
         </div>
     `;
-    chatRoom.scrollTop = chatRoom.scrollHeight;
+        chatRoom.scrollTop = chatRoom.scrollHeight;
+    }
 }
 
-function handleRemoteScreenShareStopped(data) {
-    const email = data.sender_email;
-    console.log('[Remote] Screen share stopped from:', email);
+function forceStopRemoteScreenShare(email, reason = '') {
     if (!email) return;
 
-    const name = participantInfo[email]?.displayName || email;
+    console.log(`[ScreenShare] Force stop UI for ${email}. Reason=${reason}`);
 
     delete activeScreenShares[email];
+    recentlyStoppedScreenShares[email] = Date.now();
 
     const videoBox = document.getElementById(`video-${email}`);
     if (videoBox) {
         videoBox.style.display = '';
+
         const video = videoBox.querySelector('video');
-        if (video) {
-            const pc = peers[email];
-            if (pc) {
-                const receivers = pc.getReceivers();
-                const videoReceiver = receivers.find(r => r.track?.kind === 'video');
-                const audioReceiver = receivers.find(r => r.track?.kind === 'audio');
-                if (videoReceiver?.track) {
-                    const cameraStream = new MediaStream([videoReceiver.track]);
-                    if (audioReceiver?.track) cameraStream.addTrack(audioReceiver.track);
-                    video.srcObject = cameraStream;
-                    video.play().catch(console.warn);
-                }
-            }
+        const stream = remoteStreams[email];
+
+        if (video && stream) {
+            video.srcObject = stream;
+            video.play().catch(console.warn);
         }
     }
 
     if (viewingScreenShare === email) {
+        viewingScreenShare = null;
+
+        const screenVideo = document.getElementById('screenshare-video');
+        if (screenVideo) {
+            screenVideo.pause();
+            screenVideo.srcObject = null;
+        }
+
         const remaining = Object.keys(activeScreenShares);
-        if (remaining.length === 0) {
-            viewingScreenShare = null;
-            hideScreenShareMain();
-        } else {
+
+        if (remaining.length > 0) {
             viewingScreenShare = remaining[0];
+
             const nextStream = activeScreenShares[remaining[0]]?.stream;
-            if (nextStream) {
-                const nextName = activeScreenShares[remaining[0]].name;
+            const nextName = activeScreenShares[remaining[0]]?.name || remaining[0];
+
+            if (nextStream && nextStream.getVideoTracks().length > 0) {
                 showScreenShareMain(nextStream, nextName);
+            } else {
+                hideScreenShareMain();
             }
+        } else {
+            hideScreenShareMain();
         }
     }
 
     updateScreenShareSelector();
+    updateVideoLayoutByUserCount();
+}
+
+function handleRemoteScreenShareStopped(data) {
+    const email = getParticipantEmail(data);
+
+    console.log('[Remote] Screen share stopped from:', email, data);
+
+    if (!email) return;
+
+    const name = participantInfo[email]?.displayName || email;
+
+    forceStopRemoteScreenShare(email, 'screen_share_stopped event');
 
     chatRoom.innerHTML += `
         <div class="message system" style="text-align:center;color:#666;font-style:italic;">
@@ -1089,12 +1415,116 @@ function handleRemoteScreenShareStopped(data) {
     chatRoom.scrollTop = chatRoom.scrollHeight;
 }
 
+function cleanupScreenShareForLeftUser(email, reason = '') {
+    if (!email) return;
+
+    console.log(`[ScreenShare] Cleanup for left user ${email}. Reason=${reason}`);
+
+    const wasViewingThisUser = viewingScreenShare === email;
+
+    delete activeScreenShares[email];
+    recentlyStoppedScreenShares[email] = Date.now();
+
+    const screenVideo = document.getElementById('screenshare-video');
+
+    if (wasViewingThisUser) {
+        if (screenVideo) {
+            screenVideo.pause();
+            screenVideo.srcObject = null;
+        }
+
+        const remaining = Object.keys(activeScreenShares);
+
+        if (remaining.length > 0) {
+            viewingScreenShare = remaining[0];
+
+            const nextInfo = activeScreenShares[viewingScreenShare];
+            const nextStream = nextInfo?.stream;
+            const nextName = nextInfo?.name || viewingScreenShare;
+
+            if (nextStream && nextStream.getVideoTracks().some(t => t.readyState === 'live')) {
+                showScreenShareMain(nextStream, nextName);
+            } else {
+                viewingScreenShare = null;
+                hideScreenShareMain();
+            }
+        } else {
+            viewingScreenShare = null;
+            hideScreenShareMain();
+        }
+    }
+
+    updateScreenShareSelector();
+    updateVideoLayoutByUserCount();
+}
+
+function getParticipantEmail(data) {
+    return data?.email || data?.user_email || data?.sender_email || data?.sender || data?.from || '';
+}
+
+function getParticipantFullName(data) {
+    return data?.full_name || data?.fullName || data?.username || data?.name || '';
+}
+
+function isParticipantHost(email) {
+    return !!participantInfo[email]?.isHost;
+}
+
+function getDisplayNameWithHostIcon(email, isMe = false) {
+    const info = participantInfo[email];
+
+    let name = info?.displayName || email;
+    const hostIcon = isParticipantHost(email) ? '🔑 ' : '';
+
+    if (isMe) {
+        return `${hostIcon}${name} (Bạn)`;
+    }
+
+    return `${hostIcon}${name}`;
+}
+
+function ensureParticipantInfo(data) {
+    const email = getParticipantEmail(data);
+    if (!email) return '';
+
+    const fullName = getParticipantFullName(data);
+
+    const isHostValue =
+        data?.is_host === true ||
+        data?.isHost === true ||
+        data?.role === 'host' ||
+        data?.role === 'owner';
+
+    if (!participantInfo[email]) {
+        participantInfo[email] = {
+            fullName: fullName || email.split('@')[0],
+            displayName: fullName ? `${fullName} (${email})` : email,
+            isHost: isHostValue
+        };
+    } else {
+        participantInfo[email] = {
+            ...participantInfo[email],
+            fullName: participantInfo[email].fullName || fullName || email.split('@')[0],
+            displayName: participantInfo[email].displayName || (fullName ? `${fullName} (${email})` : email),
+            isHost: participantInfo[email].isHost || isHostValue
+        };
+    }
+
+    return email;
+}
+
 function handleJoinedRoom(data) {
     isHost = data.is_host;
     roomType = data.room_type || 'instant';
 
-    const hostIcon = isHost ? '🔑 ' : '';
-    document.querySelector("#myname").innerHTML = `${hostIcon}${displayName} (Bạn)`;
+    participantInfo[userEmail] = {
+        ...(participantInfo[userEmail] || {}),
+        fullName: userFullName,
+        displayName: displayName,
+        isHost: !!isHost
+    };
+
+    document.querySelector("#myname").innerHTML = getDisplayNameWithHostIcon(userEmail, true);
 
     if (isHost) {
         cutCall.innerHTML = '<i class="fas fa-phone-slash"></i><span class="tooltiptext">Kết thúc</span>';
@@ -1111,16 +1541,26 @@ function handleJoinedRoom(data) {
 
     if (data.participants && data.participants.length > 0) {
         data.participants.forEach(p => {
-            if (p.email && p.full_name) {
-                participantInfo[p.email] = {
-                    fullName: p.full_name,
-                    displayName: `${p.full_name} (${p.email})`
-                };
-            }
+            ensureParticipantInfo(p);
         });
 
         data.participants.forEach(p => {
-            createPeerConnection(p.email, true);
+            const email = getParticipantEmail(p);
+
+            if (!email || email === userEmail) return;
+
+            createRemoteVideoElement(email, null);
+            createPeerConnection(email, true);
+
+            // Nếu backend có gửi trạng thái media của participant thì áp dụng ngay
+            if (typeof p.audio !== 'undefined' || typeof p.video !== 'undefined') {
+                handleRemoteMediaToggle({
+                    ...p,
+                    email,
+                    audio: !!p.audio,
+                    video: !!p.video
+                });
+            }
         });
 
         setTimeout(() => {
@@ -1136,62 +1576,98 @@ function handleJoinedRoom(data) {
         img.onload = () => ctx.drawImage(img, 0, 0);
         img.src = data.whiteboard;
     }
-
-    const participantCount = data.participants ? data.participants.length : 0;
-    if (participantCount > 0) {
-        chatRoom.innerHTML += `
-            <div class="message system" style="text-align:center;color:#4caf50;font-style:italic;margin:10px 0;">
-                <small>Đã tham gia cuộc họp cùng ${participantCount} người khác</small>
-            </div>
-        `;
-    }
 }
 
 function handleUserJoined(data) {
-    if (data.email && data.full_name) {
-        participantInfo[data.email] = {
-            fullName: data.full_name,
-            displayName: `${data.full_name} (${data.email})`
-        };
-    }
+    const email = ensureParticipantInfo(data);
 
-    createPeerConnection(data.email, false);
-    setTimeout(() => updateVideoNameTag(data.email), 300);
+    if (!email || email === userEmail) return;
 
-    const displayText = data.full_name
-        ? `${data.full_name} (${data.email})`
-        : data.email;
+    createRemoteVideoElement(email, null);
+
+    // Đánh dấu peer mới cần được sync lại media hiện tại sau khi mình answer offer của họ.
+    // Không sync ngay ở đây để tránh glare / đụng offer của user mới.
+    pendingInitialMediaSyncPeers.add(email);
+
+    createPeerConnection(email, false);
+
+    setTimeout(() => {
+        updateVideoNameTag(email);
+        updateVideoLayoutByUserCount();
+    }, 300);
+
+    // Quan trọng:
+    // Khi có user mới vào, user hiện tại phải gửi lại trạng thái mic/cam của mình.
+    // Nếu không, user mới sẽ thấy ô video nhưng vẫn bị overlay "Video Off".
+    rebroadcastMyMediaState(600);
+    rebroadcastMyMediaState(1200);
+    rebroadcastMyMediaState(2000);
+
+    const info = participantInfo[email];
+    const displayText = info ? info.displayName : email;
 
     const currentCount = document.querySelectorAll('.video-box').length;
 
-    chatRoom.innerHTML += `
-        <div class="message system" style="text-align:center;color:#666;font-style:italic;">
-            <small>${displayText} đã tham gia (${currentCount + 1} người đang online)</small>
-        </div>
-    `;
     chatRoom.scrollTop = chatRoom.scrollHeight;
 }
 
 function handleUserLeft(data) {
-    removeRemoteVideo(data.email);
+    const email = getParticipantEmail(data);
+    if (!email) return;
 
-    const info = participantInfo[data.email];
-    const displayText = info ? info.displayName : data.email;
+    const info = participantInfo[email];
+    const displayText = info ? info.displayName : email;
+
+    removeRemoteVideo(email);
+
     const currentCount = document.querySelectorAll('.video-box').length;
 
-    chatRoom.innerHTML += `
-        <div class="message system" style="text-align:center;color:#666;font-style:italic;">
-            <small>👋 ${displayText} đã rời đi (${currentCount} người còn lại)</small>
-        </div>
-    `;
     chatRoom.scrollTop = chatRoom.scrollHeight;
 }
 
 function handleRemoteMediaToggle(data) {
-    const muteIcon = document.getElementById(`mute-${data.email}`);
-    const vidOff = document.getElementById(`vidoff-${data.email}`);
-    if (muteIcon) muteIcon.style.visibility = data.audio ? 'hidden' : 'visible';
-    if (vidOff) vidOff.style.visibility = data.video ? 'hidden' : 'visible';
+    const email = getParticipantEmail(data);
+
+    if (!email || email === userEmail) return;
+
+    if (!document.getElementById(`video-${email}`)) {
+        createRemoteVideoElement(email, null);
+    }
+
+    const muteIcon = document.getElementById(`mute-${email}`);
+    const vidOff = document.getElementById(`vidoff-${email}`);
+
+    if (muteIcon && typeof data.audio !== 'undefined') {
+        muteIcon.style.visibility = data.audio ? 'hidden' : 'visible';
+    }
+
+    if (vidOff && typeof data.video !== 'undefined') {
+        vidOff.style.visibility = data.video ? 'hidden' : 'visible';
+    }
+
+    if (data.video === true) {
+        const videoBox = document.getElementById(`video-${email}`);
+        if (videoBox && !activeScreenShares[email]) {
+            videoBox.style.display = '';
+        }
+
+        const video = videoBox?.querySelector('video');
+        const stream = remoteStreams[email];
+
+        if (video && stream && video.srcObject !== stream) {
+            video.srcObject = stream;
+            video.play().catch(console.warn);
+        }
+    }
+
+    // Fallback quan trọng:
+    // Nếu user đang được xem là screen share mà gửi video:false,
+    // thì xem như họ đã dừng share, kể cả khi screen_share_stopped không được broadcast.
+    if (data.video === false && activeScreenShares[email]) {
+        forceStopRemoteScreenShare(email, 'media_toggle video=false');
+    }
+
+    updateVideoLayoutByUserCount();
 }
 
 async function loadChatHistory() {
@@ -1228,33 +1704,190 @@ function fitToContainer(canvas) {
 fitToContainer(canvas);
 window.onresize = () => fitToContainer(canvas);
 
-navigator.mediaDevices.getUserMedia({ video: true, audio: true })
-    .then(stream => {
-        mystream = stream;
-        myCameraStream = stream.clone();
-        myvideo.srcObject = stream;
-        myvideo.muted = true;
+function setControlDisabled(button, disabled, reason) {
+    if (!button) return;
 
-        // Tắt mic và camera mặc định
-        mystream.getAudioTracks().forEach(track => track.enabled = false);
-        mystream.getVideoTracks().forEach(track => track.enabled = false);
-        audioAllowed = 0;
-        videoAllowed = 0;
-        // Cập nhật icon
+    if (disabled) {
+        button.classList.add('disabled');
+        button.style.opacity = '0.45';
+        button.style.pointerEvents = 'none';
+        button.title = reason || 'Thiết bị không khả dụng';
+    } else {
+        button.classList.remove('disabled');
+        button.style.opacity = '';
+        button.style.pointerEvents = '';
+        button.title = '';
+    }
+}
+
+function updateLocalMediaUI() {
+    if (!hasMicrophoneDevice) {
         audioButt.innerHTML = '<i class="fas fa-microphone-slash"></i>';
-        audioButt.style.backgroundColor = "#b12c2c";
-        videoButt.innerHTML = '<i class="fas fa-video-slash"></i>';
-        videoButt.style.backgroundColor = "#b12c2c";
+        audioButt.style.backgroundColor = '#555';
+        setControlDisabled(audioButt, true, 'Không tìm thấy micro');
         document.querySelector("#mymuteicon").style.visibility = 'visible';
-        document.querySelector("#myvideooff").style.visibility = 'visible';
+    } else if (audioAllowed) {
+        audioButt.innerHTML = '<i class="fas fa-microphone"></i>';
+        audioButt.style.backgroundColor = '#323cae';
+        setControlDisabled(audioButt, false);
+        document.querySelector("#mymuteicon").style.visibility = 'hidden';
+    } else {
+        audioButt.innerHTML = '<i class="fas fa-microphone-slash"></i>';
+        audioButt.style.backgroundColor = '#b12c2c';
+        setControlDisabled(audioButt, false);
+        document.querySelector("#mymuteicon").style.visibility = 'visible';
+    }
 
-        getUserInfo();
-    })
-    .catch(err => {
-        console.error('Media error:', err);
-        alert('Không thể truy cập camera/microphone');
-        getUserInfo();
-    });
+    if (!hasCameraDevice) {
+        videoButt.innerHTML = '<i class="fas fa-video-slash"></i>';
+        videoButt.style.backgroundColor = '#555';
+        setControlDisabled(videoButt, true, 'Không tìm thấy camera');
+        document.querySelector("#myvideooff").style.visibility = 'visible';
+    } else if (videoAllowed) {
+        videoButt.innerHTML = '<i class="fas fa-video"></i>';
+        videoButt.style.backgroundColor = '#323cae';
+        setControlDisabled(videoButt, false);
+        document.querySelector("#myvideooff").style.visibility = 'hidden';
+    } else {
+        videoButt.innerHTML = '<i class="fas fa-video-slash"></i>';
+        videoButt.style.backgroundColor = '#b12c2c';
+        setControlDisabled(videoButt, false);
+        document.querySelector("#myvideooff").style.visibility = 'visible';
+    }
+}
+
+function notifyMyMediaState() {
+    if (ws && ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({
+            type: 'media_toggle',
+            sender_email: userEmail,
+            email: userEmail,
+            audio: !!audioAllowed,
+            video: getAdvertisedVideoState()
+        }));
+    }
+}
+
+function notifyLeavingMeeting() {
+    try {
+        if (ws && ws.readyState === WebSocket.OPEN) {
+            if (screenshareEnabled) {
+                ws.send(JSON.stringify({
+                    type: 'screen_share_stopped',
+                    sender_email: userEmail,
+                    email: userEmail
+                }));
+            }
+
+            ws.send(JSON.stringify({
+                type: 'media_toggle',
+                sender_email: userEmail,
+                email: userEmail,
+                audio: false,
+                video: false
+            }));
+        }
+    } catch (e) {
+        console.warn('[LeavingMeeting] Cannot notify cleanly:', e);
+    }
+}
+
+window.addEventListener('pagehide', notifyLeavingMeeting);
+window.addEventListener('beforeunload', notifyLeavingMeeting);
+
+function rebroadcastMyMediaState(delay = 500) {
+    setTimeout(() => {
+        if (!ws || ws.readyState !== WebSocket.OPEN) return;
+
+        ws.send(JSON.stringify({
+            type: 'media_toggle',
+            sender_email: userEmail,
+            email: userEmail,
+            audio: !!audioAllowed,
+            video: getAdvertisedVideoState()
+        }));
+    }, delay);
+}
+
+function createEmptyLocalStream() {
+    return new MediaStream();
+}
+
+async function initLocalMedia() {
+    let audioStream = null;
+    let videoStream = null;
+
+    try {
+        const devices = await navigator.mediaDevices.enumerateDevices();
+        hasCameraDevice = devices.some(d => d.kind === 'videoinput');
+        hasMicrophoneDevice = devices.some(d => d.kind === 'audioinput');
+    } catch (err) {
+        console.warn('Không thể kiểm tra danh sách thiết bị:', err);
+        hasCameraDevice = true;
+        hasMicrophoneDevice = true;
+    }
+
+    if (hasMicrophoneDevice) {
+        try {
+            audioStream = await navigator.mediaDevices.getUserMedia({
+                audio: true,
+                video: false
+            });
+        } catch (err) {
+            console.warn('Không thể truy cập micro:', err);
+            hasMicrophoneDevice = false;
+        }
+    }
+
+    if (hasCameraDevice) {
+        try {
+            videoStream = await navigator.mediaDevices.getUserMedia({
+                audio: false,
+                video: true
+            });
+        } catch (err) {
+            console.warn('Không thể truy cập camera:', err);
+            hasCameraDevice = false;
+        }
+    }
+
+    const tracks = [
+        ...(audioStream ? audioStream.getAudioTracks() : []),
+        ...(videoStream ? videoStream.getVideoTracks() : [])
+    ];
+
+    mystream = tracks.length ? new MediaStream(tracks) : createEmptyLocalStream();
+
+    const cameraTracks = videoStream ? videoStream.getVideoTracks() : [];
+    myCameraStream = cameraTracks.length ? new MediaStream(cameraTracks) : createEmptyLocalStream();
+
+    if (myvideo) {
+        myvideo.srcObject = mystream;
+        myvideo.muted = true;
+        myvideo.play().catch(console.warn);
+    }
+
+    // Mặc định vẫn tắt mic/cam như logic cũ
+    mystream.getAudioTracks().forEach(track => track.enabled = false);
+    mystream.getVideoTracks().forEach(track => track.enabled = false);
+
+    audioAllowed = 0;
+    videoAllowed = 0;
+
+    updateLocalMediaUI();
+
+    if (!hasCameraDevice && !hasMicrophoneDevice) {
+        console.warn('Thiết bị không có camera và micro, vẫn cho phép tham gia phòng.');
+    } else if (!hasCameraDevice) {
+        console.warn('Thiết bị không có camera, vẫn cho phép tham gia phòng.');
+    } else if (!hasMicrophoneDevice) {
+        console.warn('Thiết bị không có micro, vẫn cho phép tham gia phòng.');
+    }
+
+    getUserInfo();
+}
+
+initLocalMedia();
 
 document.querySelector('.roomcode').innerHTML = `${roomid}`;
 
@@ -1268,54 +1901,95 @@ function CopyClassText() {
 // =================== CONTROLS ===================
 
 videoButt.addEventListener('click', () => {
+    if (!hasCameraDevice || !mystream || mystream.getVideoTracks().length === 0) {
+        alert('Thiết bị này không có camera hoặc camera không khả dụng');
+        updateLocalMediaUI();
+        return;
+    }
+
+    const cameraTrack =
+        myCameraStream?.getVideoTracks?.()[0] ||
+        mystream?.getVideoTracks?.()[0] ||
+        null;
+
+    if (!cameraTrack) {
+        alert('Không tìm thấy camera track');
+        updateLocalMediaUI();
+        return;
+    }
+
     if (videoAllowed) {
-        if (mystream) mystream.getVideoTracks().forEach(t => t.enabled = false);
-        Object.values(peers).forEach(pc => {
-            const sender = pc.getSenders().find(s => s.track?.kind === "video");
-            if (sender) sender.track.enabled = false;
-        });
-        videoButt.innerHTML = '<i class="fas fa-video-slash"></i>';
-        videoButt.style.backgroundColor = "#b12c2c";
-        document.querySelector("#myvideooff").style.visibility = 'visible';
+        // Tắt camera local
+        cameraTrack.enabled = false;
+        mystream.getVideoTracks().forEach(t => t.enabled = false);
+
         videoAllowed = 0;
-        ws.send(JSON.stringify({ type: 'media_toggle', video: false }));
-    } else {
-        if (mystream) mystream.getVideoTracks().forEach(t => t.enabled = true);
-        Object.values(peers).forEach(pc => {
-            const sender = pc.getSenders().find(s => s.track?.kind === "video");
-            if (sender) sender.track.enabled = true;
+        updateLocalMediaUI();
+
+        // Đồng bộ lại video track cho tất cả peer
+        Object.entries(peers).forEach(([peerEmail]) => {
+            syncOutgoingMediaToPeer(peerEmail, 'video disabled');
         });
-        videoButt.innerHTML = '<i class="fas fa-video"></i>';
-        videoButt.style.backgroundColor = "#323cae";
-        document.querySelector("#myvideooff").style.visibility = 'hidden';
+
+        ws.send(JSON.stringify({
+            type: 'media_toggle',
+            sender_email: userEmail,
+            email: userEmail,
+            video: false,
+            audio: !!audioAllowed
+        }));
+    } else {
+        // Bật camera local
+        cameraTrack.enabled = true;
+        mystream.getVideoTracks().forEach(t => t.enabled = true);
+
         videoAllowed = 1;
-        ws.send(JSON.stringify({ type: 'media_toggle', video: true }));
+        updateLocalMediaUI();
+
+        // Đồng bộ lại video track cho tất cả peer
+        Object.entries(peers).forEach(([peerEmail]) => {
+            syncOutgoingMediaToPeer(peerEmail, 'video enabled');
+        });
+
+        ws.send(JSON.stringify({
+            type: 'media_toggle',
+            sender_email: userEmail,
+            email: userEmail,
+            video: true,
+            audio: !!audioAllowed
+        }));
     }
 });
 
 audioButt.addEventListener('click', () => {
+    if (!hasMicrophoneDevice || !mystream || mystream.getAudioTracks().length === 0) {
+        alert('Thiết bị này không có micro hoặc micro không khả dụng');
+        updateLocalMediaUI();
+        return;
+    }
+
     if (audioAllowed) {
         if (mystream) mystream.getAudioTracks().forEach(t => t.enabled = false);
         Object.values(peers).forEach(pc => {
             const sender = pc.getSenders().find(s => s.track?.kind === "audio");
             if (sender) sender.track.enabled = false;
         });
-        audioButt.innerHTML = '<i class="fas fa-microphone-slash"></i>';
-        audioButt.style.backgroundColor = "#b12c2c";
-        document.querySelector("#mymuteicon").style.visibility = 'visible';
+
         audioAllowed = 0;
-        ws.send(JSON.stringify({ type: 'media_toggle', audio: false }));
+        updateLocalMediaUI();
+
+        ws.send(JSON.stringify({ type: 'media_toggle', audio: false, video: !!videoAllowed }));
     } else {
         if (mystream) mystream.getAudioTracks().forEach(t => t.enabled = true);
         Object.values(peers).forEach(pc => {
             const sender = pc.getSenders().find(s => s.track?.kind === "audio");
             if (sender) sender.track.enabled = true;
         });
-        audioButt.innerHTML = '<i class="fas fa-microphone"></i>';
-        audioButt.style.backgroundColor = "#323cae";
-        document.querySelector("#mymuteicon").style.visibility = 'hidden';
+
         audioAllowed = 1;
-        ws.send(JSON.stringify({ type: 'media_toggle', audio: true }));
+        updateLocalMediaUI();
+
+        ws.send(JSON.stringify({ type: 'media_toggle', audio: true, video: !!videoAllowed }));
     }
 });
 
@@ -1340,18 +2014,33 @@ function screenShareToggle() {
                 // replaceTrack rồi renegotiate để remote nhận ontrack mới
                 pendingScreenSharePeers.clear();
                 const replacePromises = Object.entries(peers).map(async ([peerEmail, pc]) => {
-                    const sender = pc.getSenders().find(s => s.track?.kind === "video");
-                    if (sender) {
-                        await sender.replaceTrack(myScreenTrack);
-                        try {
-                            const offer = await pc.createOffer();
-                            await pc.setLocalDescription(offer);
-                            pendingScreenSharePeers.add(peerEmail); // chờ answer từ peer này
-                            ws.send(JSON.stringify({ type: 'offer', target: peerEmail, offer }));
-                            console.log(`[ScreenShare] Renegotiated with ${peerEmail}`);
-                        } catch (e) {
-                            console.error(`[ScreenShare] Renegotiate error with ${peerEmail}:`, e);
-                        }
+                    let videoTransceiver = peerVideoTransceivers[peerEmail];
+
+                    if (!videoTransceiver) {
+                        videoTransceiver = pc.addTransceiver('video', {
+                            direction: 'sendrecv'
+                        });
+                        peerVideoTransceivers[peerEmail] = videoTransceiver;
+                        peerVideoSenders[peerEmail] = videoTransceiver.sender;
+                    }
+
+                    videoTransceiver.direction = 'sendrecv';
+
+                    try {
+                        await videoTransceiver.sender.replaceTrack(myScreenTrack);
+
+                        const offer = await pc.createOffer();
+                        await pc.setLocalDescription(offer);
+
+                        pendingScreenSharePeers.add(peerEmail);
+
+                        ws.send(JSON.stringify({
+                            type: 'offer',
+                            target: peerEmail,
+                            offer
+                        }));
+                    } catch (e) {
+                        console.error(`[ScreenShare] Renegotiate error with ${peerEmail}:`, e);
                     }
                 });
                 await Promise.all(replacePromises);
@@ -1383,7 +2072,7 @@ function screenShareToggle() {
                     if (screenshareEnabled) stopScreenShare();
                 };
             })
-            .catch((e) => alert("Unable to share screen: " + e.message));
+            .catch((e) => console.log('Error accessing display media:', e));
     } else {
         stopScreenShare();
     }
@@ -1399,21 +2088,86 @@ function stopScreenShare() {
         myScreenTrack = null;
     }
 
-    ws.send(JSON.stringify({
-        type: 'screen_share_stopped',
-        sender_email: userEmail
-    }));
+    const cameraTrack =
+        myCameraStream?.getVideoTracks?.()[0] ||
+        mystream?.getVideoTracks?.()[0] ||
+        null;
 
-    const cameraTrack = myCameraStream.getVideoTracks()[0];
+    if (!cameraTrack) {
+        // Báo cho user khác tắt UI share NGAY, không chờ WebRTC renegotiate
+        ws.send(JSON.stringify({
+            type: 'screen_share_stopped',
+            sender_email: userEmail,
+            email: userEmail
+        }));
+
+        Object.entries(peers).forEach(async ([peerEmail]) => {
+            const videoTransceiver = peerVideoTransceivers[peerEmail];
+            if (!videoTransceiver) return;
+
+            try {
+                await videoTransceiver.sender.replaceTrack(null);
+
+                // Không có camera thì quay lại trạng thái chỉ nhận video người khác
+                videoTransceiver.direction = 'recvonly';
+
+                await renegotiatePeer(peerEmail, 'stop screen share no camera');
+            } catch (e) {
+                console.error(`[StopScreenShare no camera] error with ${peerEmail}:`, e);
+            }
+        });
+
+        mystream = mystream || createEmptyLocalStream();
+
+        delete activeScreenShares[userEmail];
+
+        if (viewingScreenShare === userEmail) {
+            viewingScreenShare = null;
+
+            const screenVideo = document.getElementById('screenshare-video');
+            if (screenVideo) {
+                screenVideo.pause();
+                screenVideo.srcObject = null;
+            }
+
+            hideScreenShareMain();
+        }
+
+        updateScreenShareSelector();
+        updateVideoLayoutByUserCount();
+
+        screenShareButt.innerHTML = '<i class="fas fa-desktop"></i><span class="tooltiptext">Chia sẻ màn hình</span>';
+        screenShareButt.style.backgroundColor = '';
+
+        ws.send(JSON.stringify({
+            type: 'media_toggle',
+            sender_email: userEmail,
+            email: userEmail,
+            audio: !!audioAllowed,
+            video: false
+        }));
+
+        return;
+    }
+
     // replaceTrack + renegotiate để remote nhận lại camera stream
     Object.entries(peers).forEach(async ([peerEmail, pc]) => {
-        const sender = pc.getSenders().find(s => s.track?.kind === "video");
-        if (sender) {
-            await sender.replaceTrack(cameraTrack);
+        const videoTransceiver = peerVideoTransceivers[peerEmail];
+
+        if (videoTransceiver) {
+            videoTransceiver.direction = 'sendrecv';
+            await videoTransceiver.sender.replaceTrack(cameraTrack);
+
             try {
                 const offer = await pc.createOffer();
                 await pc.setLocalDescription(offer);
-                ws.send(JSON.stringify({ type: 'offer', target: peerEmail, offer }));
+
+                ws.send(JSON.stringify({
+                    type: 'offer',
+                    target: peerEmail,
+                    offer
+                }));
+
                 console.log(`[StopScreenShare] Renegotiated with ${peerEmail}`);
             } catch (e) {
                 console.error(`[StopScreenShare] Renegotiate error:`, e);
@@ -1443,6 +2197,11 @@ function stopScreenShare() {
             updateScreenShareSelector();
         }
     }
+
+    ws.send(JSON.stringify({
+        type: 'screen_share_stopped',
+        sender_email: userEmail
+    }));
 
     screenShareButt.innerHTML = '<i class="fas fa-desktop"></i><span class="tooltiptext">Share Screen</span>';
     screenShareButt.style.backgroundColor = '';
@@ -1570,7 +2329,7 @@ attachBtn.style.cssText = `
 attachBtn.onmouseover = () => { attachBtn.style.borderColor = '#323cae'; attachBtn.style.color = '#323cae'; };
 attachBtn.onmouseout = () => { attachBtn.style.borderColor = '#aaa'; attachBtn.style.color = '#555'; };
 attachBtn.onclick = () => fileInput.click();
-// Thêm vào ci-send (bên cạnh nút Gửi), đặt trước nút Gửi
+
 const ciSend = document.querySelector('.ci-send');
 ciSend.insertBefore(attachBtn, ciSend.firstChild);
 
@@ -1697,31 +2456,35 @@ setInterval(() => {
     }
 }, 5000);
 
-// =================== END CALL ===================
-
-// cutCall.addEventListener('click', () => {
-//     if (isHost && confirm('Bạn có chắc muốn kết thúc cuộc họp cho tất cả? Mọi file sẽ bị xóa.')) {
-//         ws.send(JSON.stringify({ type: 'end_room' }));
-//     } else if (!isHost) {
-//         ws.close();
-//         location.href = '/';
-//     }
-// });
-
-// window.addEventListener('beforeunload', () => {
-//     if (ws && ws.readyState === WebSocket.OPEN) ws.close();
-// });
 cutCall.addEventListener('click', () => {
-    if (isHost && confirm('Bạn có chắc muốn kết thúc cuộc họp cho tất cả? Mọi file sẽ bị xóa.')) {
-        ws.send(JSON.stringify({ type: 'end_room' }));
-    } else if (!isHost) {
-        const savedChannel = sessionStorage.getItem('lastVoiceChannel');
-        const savedChatroom = sessionStorage.getItem('lastVoiceRoom');
-        if (savedChannel && savedChatroom) {
-            location.href = `/channel.html?channel=${savedChannel}&chatroom=${savedChatroom}&return=1`;
-        } else {
-            location.href = '/';
+    notifyLeavingMeeting();
+
+    if (isHost) {
+        if (confirm('Bạn có chắc muốn kết thúc cuộc họp cho tất cả?')) {
+            if (screenshareEnabled) {
+                stopScreenShare();
+            }
+
+            ws.send(JSON.stringify({ type: 'end_room' }));
         }
+
+        return;
+    }
+
+    if (screenshareEnabled) {
+        stopScreenShare();
+    }
+
+    const savedChannel = sessionStorage.getItem('lastVoiceChannel');
+    const savedChatroom = sessionStorage.getItem('lastVoiceRoom');
+
+    if (ws && ws.readyState === WebSocket.OPEN) {
         ws.close();
+    }
+
+    if (savedChannel && savedChatroom) {
+        location.href = `/channel.html?channel=${savedChannel}&chatroom=${savedChatroom}&return=1`;
+    } else {
+        location.href = '/';
     }
 });
